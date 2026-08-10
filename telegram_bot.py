@@ -381,6 +381,34 @@ def call_api(endpoint, params, timeout=120):
     return data
 
 
+def cached_region_for_uid(uid):
+    cache = read_json_file(os.path.join(BASE_DIR, "regions.json"), {})
+    item = cache.get(str(uid))
+    if isinstance(item, dict):
+        region = item.get("region") or item.get("Region")
+    else:
+        region = item
+    return str(region).upper() if region else None
+
+
+def resolve_like_region(uid, requested_region=None):
+    cached_region = cached_region_for_uid(uid)
+    if cached_region:
+        return cached_region, "cache"
+    if requested_region:
+        data = call_api("check-region", {"uid": uid}, timeout=180)
+        if "error" in data:
+            error_text = str(data.get("error") or "")
+            if "timeout" in error_text.lower() or "timed out" in error_text.lower():
+                return None, "timeout"
+            return None, "not_found"
+        detected = data.get("Region") or data.get("region")
+        if detected:
+            return str(detected).upper(), "check-region"
+        return None, "not_found"
+    return None, "auto"
+
+
 def utf16_len(text):
     return len(str(text).encode("utf-16-le")) // 2
 
@@ -1328,9 +1356,19 @@ def process_like(message, endpoint, uid, region=None):
         "⏳ Processing like request...",
         parse_mode=None,
     )
+    resolved_region, region_source = resolve_like_region(uid, region)
+    if region and not resolved_region:
+        error_text = "Request timeout. Please try again later." if region_source == "timeout" else "User not found or region is incorrect."
+        bot.edit_message_text(
+            chat_id=status_msg.chat.id,
+            message_id=status_msg.message_id,
+            text=f"❌ LIKE REQUEST FAILED\n━━━━━━━━━━━━━━━━━━\n{error_text}",
+            parse_mode=None,
+        )
+        return
     params = {"uid": uid}
-    if region:
-        params["region"] = region
+    if resolved_region:
+        params["region"] = resolved_region
     data = call_api(endpoint, params)
     if not data.get("success") or "error" in data:
         error_text = str(data.get("error") or "Request failed")
