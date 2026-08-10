@@ -1333,10 +1333,21 @@ def process_like(message, endpoint, uid, region=None):
         params["region"] = region
     data = call_api(endpoint, params)
     if not data.get("success") or "error" in data:
+        error_text = str(data.get("error") or "Request failed")
+        if (
+            "Client error" in error_text
+            or "Bad Request" in error_text
+            or "GetPlayerPersonalShow" in error_text
+            or "developer.mozilla.org" in error_text
+            or "UID not found" in error_text
+        ):
+            error_text = "User not found or region is incorrect."
+        elif "timeout" in error_text.lower() or "timed out" in error_text.lower():
+            error_text = "Request timeout. Please try again later."
         bot.edit_message_text(
             chat_id=status_msg.chat.id,
             message_id=status_msg.message_id,
-            text=f"❌ LIKE REQUEST FAILED\n━━━━━━━━━━━━━━━━━━\n{data.get('error', 'Request failed')}",
+            text=f"❌ LIKE REQUEST FAILED\n━━━━━━━━━━━━━━━━━━\n{error_text}",
             parse_mode=None,
         )
         return
