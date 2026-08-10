@@ -3,6 +3,7 @@ import json
 import os
 import random
 import re
+import socket
 import subprocess
 import sys
 import threading
@@ -96,6 +97,7 @@ if not BOT_TOKEN:
     raise SystemExit("BOT_TOKEN is required")
 
 bot = telebot.TeleBot(BOT_TOKEN)
+INSTANCE_LOCK_SOCKET = None
 usage_tracker = {}
 chat_title_cache = {}
 seen_users_db = {}
@@ -362,6 +364,22 @@ def join_markup(missing_channels=None):
 
 def get_user_limit(user_id):
     return 999999999 if OWNER_ID and user_id == OWNER_ID else DAILY_LIMIT
+
+
+def acquire_bot_instance_lock():
+    global INSTANCE_LOCK_SOCKET
+    lock_port = int(os.getenv("BOT_INSTANCE_LOCK_PORT", "47891"))
+    lock_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    lock_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        lock_socket.bind(("127.0.0.1", lock_port))
+        lock_socket.listen(1)
+    except OSError:
+        lock_socket.close()
+        logger.error("Another telegram_bot.py instance is already running. Stop the old bot before starting a new one.")
+        return False
+    INSTANCE_LOCK_SOCKET = lock_socket
+    return True
 
 
 def call_api(endpoint, params, timeout=120):
@@ -3874,6 +3892,8 @@ def process_auto_token_refresh():
 
 
 if __name__ == "__main__":
+    if not acquire_bot_instance_lock():
+        raise SystemExit(1)
     threading.Thread(target=reset_limits, daemon=True).start()
     threading.Thread(target=process_autolikeff_orders, daemon=True).start()
     threading.Thread(target=process_autolikeff_near_end_notices, daemon=True).start()
