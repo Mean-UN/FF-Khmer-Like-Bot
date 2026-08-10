@@ -625,6 +625,18 @@ def autolike_group_allowed(chat_id):
     return str(chat_id) in set(load_autolike_groups())
 
 
+def resolve_autolike_group_id(message):
+    allowed_groups = load_autolike_groups()
+    current_chat_id = str(message.chat.id)
+    if current_chat_id in allowed_groups:
+        return current_chat_id
+    if allowed_groups:
+        return allowed_groups[0]
+    if message.chat.type in {"group", "supergroup"}:
+        return current_chat_id
+    return ""
+
+
 def can_manage_autolike(message):
     if is_owner(message.from_user.id):
         return True
@@ -833,17 +845,11 @@ def format_autolike_delivery(order, data, likes_sent, private=False):
 
 def notify_autolike_order(order, group_text, private_text=None):
     group_id = order.get("group_id")
-    user_id = order.get("telegram_user_id")
     if group_id:
         try:
             bot.send_message(int(group_id), group_text, parse_mode=None)
         except Exception as exc:
             logger.warning("Autolike group notify failed for %s: %s", group_id, exc)
-    if user_id:
-        try:
-            bot.send_message(int(user_id), private_text or group_text, parse_mode=None)
-        except Exception as exc:
-            logger.warning("Autolike private notify failed for %s: %s", user_id, exc)
 
 
 def find_existing_autolike_order(orders, uid):
@@ -1305,7 +1311,7 @@ def build_help_text(chat_id=None, user_id=None):
     return "\n".join(lines)
 
 
-def process_like(message, endpoint, uid):
+def process_like(message, endpoint, uid, region=None):
     user_id = message.from_user.id
     now = datetime.now(CAMBODIA_TZ)
     usage = usage_tracker.get(user_id, {"used": 0, "last_used": now - timedelta(days=1)})
@@ -1314,16 +1320,24 @@ def process_like(message, endpoint, uid):
 
     limit = get_user_limit(user_id)
     if usage["used"] >= limit:
-        reply_premium(message, "⛔ Daily request limit reached.\n📌 Please try again tomorrow.")
+        bot.reply_to(message, "⛔ Daily request limit reached.\n━━━━━━━━━━━━━━━━━━\n📌 Please try again tomorrow.", parse_mode=None)
         return
 
-    status_msg = reply_premium(message, "⏳ Processing likes...\n━━━━━━━━━━━━━━━━━━\nPlease wait.")
-    data = call_api(endpoint, {"uid": uid})
+    status_msg = bot.reply_to(
+        message,
+        "⏳ Processing like request...",
+        parse_mode=None,
+    )
+    params = {"uid": uid}
+    if region:
+        params["region"] = region
+    data = call_api(endpoint, params)
     if not data.get("success") or "error" in data:
-        edit_premium_message(
+        bot.edit_message_text(
             chat_id=status_msg.chat.id,
             message_id=status_msg.message_id,
             text=f"❌ LIKE REQUEST FAILED\n━━━━━━━━━━━━━━━━━━\n{data.get('error', 'Request failed')}",
+            parse_mode=None,
         )
         return
 
@@ -1335,14 +1349,14 @@ def process_like(message, endpoint, uid):
         owner_contact = owner_contact_text()
         text = "\n".join([
             "⚠️ UID Already Reached Max Likes For Now.",
-            "",
+            "━━━━━━━━━━━━━━━━━━",
             f"👤 Name: {data.get('PlayerNickname', 'N/A')}",
             f"🆔 UID: {data.get('UID', uid)}",
             f"🌍 Region: {data.get('Region', 'N/A')}",
             f"👍 Likes Before: {data.get('LikesbeforeCommand', 'N/A')}",
             f"➕ Likes Added: {likes_added}",
             f"❤️ Total Now: {data.get('LikesafterCommand', 'N/A')}",
-            "",
+            "━━━━━━━━━━━━━━━━━━",
             "💥 Daily 220 Likes!",
             f"🚀 Contact {owner_contact} to purchase Likes.",
         ])
@@ -1356,7 +1370,7 @@ def process_like(message, endpoint, uid):
     owner_contact = owner_contact_text()
     text = "\n".join([
         "✅ Like Request Processed Successfully",
-        "",
+        "━━━━━━━━━━━━━━━━━━",
         f"👤 Name: {data.get('PlayerNickname', 'N/A')}",
         f"🆔 UID: {data.get('UID', uid)}",
         f"🌍 Region: {data.get('Region', 'N/A')}",
@@ -1364,7 +1378,7 @@ def process_like(message, endpoint, uid):
         f"➕ Likes Added: {likes_added}",
         f"❤️ Total Now: {data.get('LikesafterCommand', 'N/A')}",
         f"📌 Requests Left: {'∞' if limit >= 999999 else limit - usage['used']}",
-        "",
+        "━━━━━━━━━━━━━━━━━━",
         "💥 Daily 220 Likes!",
         f"🚀 Contact {owner_contact} to purchase Likes.",
     ])
@@ -1375,14 +1389,24 @@ def handle_like_command(message, endpoint):
     if not check_access(message):
         return
     args = message.text.split()
-    if len(args) != 2:
-        reply_premium(message, f"⚠️ Invalid format.\n📌 Use: /{endpoint} <uid>")
+    usage = "\n".join([
+        "ℹ️ Usage:",
+        f"• /{endpoint} <uid>",
+        f"• /{endpoint} <region> <uid>",
+    ])
+    if len(args) == 2:
+        region = None
+        uid = args[1]
+    elif len(args) == 3:
+        region = args[1].upper()
+        uid = args[2]
+    else:
+        bot.reply_to(message, usage, parse_mode=None)
         return
-    uid = args[1]
     if not uid.isdigit():
-        reply_premium(message, f"⚠️ Invalid UID.\n📌 Use: /{endpoint} <uid>")
+        bot.reply_to(message, f"⚠️ Invalid UID.\n━━━━━━━━━━━━━━━━━━\n{usage}", parse_mode=None)
         return
-    threading.Thread(target=process_like, args=(message, endpoint, uid), daemon=True).start()
+    threading.Thread(target=process_like, args=(message, endpoint, uid, region), daemon=True).start()
 
 
 def pick(data, *keys, default="N/A"):
@@ -2288,6 +2312,7 @@ def autolikeff_command(message):
         return
 
     now_text = datetime.now(CAMBODIA_TZ).strftime("%d %b %Y %H:%M:%S")
+    group_id = resolve_autolike_group_id(message)
     with autolike_lock:
         orders = load_autolike_orders()
         existing_order = find_existing_autolike_order(orders, uid)
@@ -2310,7 +2335,7 @@ def autolikeff_command(message):
             "total_likes": total_likes,
             "sent_likes": 0,
             "telegram_user_id": telegram_user_id,
-            "group_id": str(message.chat.id),
+            "group_id": group_id,
             "created_by": str(message.from_user.id),
             "created_at": now_text,
             "status": "active",
@@ -2331,10 +2356,6 @@ def autolikeff_command(message):
         "⏳ First delivery is processing now.",
     ])
     bot.reply_to(message, text, parse_mode="HTML")
-    try:
-        bot.send_message(int(telegram_user_id), text, parse_mode="HTML")
-    except Exception as exc:
-        bot.reply_to(message, f"⚠️ PRIVATE MESSAGE FAILED\n━━━━━━━━━━━━━━━━━━\nUser must start the bot first.\nError: {exc}", parse_mode=None)
     threading.Thread(target=deliver_autolikeff_order_now, args=(order["order_id"],), daemon=True).start()
 
 
@@ -2393,7 +2414,7 @@ def ffinfo_command(message):
 def process_ffinfo(message, uid):
     status_msg = bot.reply_to(
         message,
-        "⏳ Loading Free Fire profile...\n━━━━━━━━━━━━━━━━━━\nPlease wait, region scan can take some time.",
+        "⏳ Loading Free Fire profile...",
         parse_mode=None,
     )
     data = call_api("meanffinfo", {"uid": uid}, timeout=180)
@@ -2426,7 +2447,7 @@ def level_command(message):
 def process_level_tracker(message, uid):
     status_msg = bot.reply_to(
         message,
-        "⏳ Loading level tracker...\n━━━━━━━━━━━━━━━━━━\nPlease wait.",
+        "⏳ Loading level tracker...",
         parse_mode=None,
     )
     data = call_api("meanffinfo", {"uid": uid}, timeout=180)
@@ -2634,7 +2655,7 @@ def region_command(message):
 def process_region_check(message, uid):
     status_msg = bot.reply_to(
         message,
-        "⏳ Checking region...\n━━━━━━━━━━━━━━━━━━\nPlease wait.",
+        "⏳ Checking region...",
         parse_mode=None,
     )
     data = call_api("check-region", {"uid": uid}, timeout=180)
