@@ -1,0 +1,37 @@
+# Python cache/build output
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Generated account/token data
+tokens.json
+tokens_likeff.json
+uidpass.json
+uidpass_likeff.json
+autolikeff_orders.json
+autolikeff_groups.json
+regions.json
+Guest-*.json
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+
+# Editor/OS files
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini

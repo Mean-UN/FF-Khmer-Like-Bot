@@ -1,0 +1,2 @@
+"""Local generated protobuf modules."""
+
