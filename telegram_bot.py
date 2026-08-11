@@ -14,6 +14,7 @@ from types import SimpleNamespace
 
 import requests
 import telebot
+from telebot import apihelper
 from telebot.apihelper import ApiTelegramException
 from telebot.types import ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity
 
@@ -41,6 +42,7 @@ load_local_env()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:5000").rstrip("/")
 OWNER_ID = int(os.getenv("OWNER_ID", "0") or 0)
+TELEGRAM_PROXY = os.getenv("TELEGRAM_PROXY", "").strip()
 GROUP_JOIN_LINK = os.getenv("GROUP_JOIN_LINK", "")
 REQUIRED_CHANNELS = [c.strip() for c in os.getenv("REQUIRED_CHANNELS", "").split(",") if c.strip()]
 DAILY_LIMIT = 1
@@ -95,6 +97,13 @@ PREMIUM_EMOJIS = [
 
 if not BOT_TOKEN:
     raise SystemExit("BOT_TOKEN is required")
+
+if TELEGRAM_PROXY:
+    apihelper.proxy = {
+        "http": TELEGRAM_PROXY,
+        "https": TELEGRAM_PROXY,
+    }
+    logger.info("Telegram proxy configured")
 
 bot = telebot.TeleBot(BOT_TOKEN)
 INSTANCE_LOCK_SOCKET = None
