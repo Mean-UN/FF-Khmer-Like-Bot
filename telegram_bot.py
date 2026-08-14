@@ -65,6 +65,10 @@ AUTOLIKEFF_NEAR_END_THRESHOLD = AUTOLIKEFF_DEFAULT_BATCH * 3
 AUTOLIKEFF_ORDER_DELAY = 30
 AUTOLIKEFF_ORDERS_FILE = os.path.join(BASE_DIR, "autolikeff_orders.json")
 AUTOLIKEFF_GROUPS_FILE = os.path.join(BASE_DIR, "autolikeff_groups.json")
+TELEGRAM_USERS_FILE = os.path.join(BASE_DIR, "telegram_users.json")
+GUESTGEN_SUPPORTED_REGIONS = [
+    "IND", "SG", "RU", "ID", "TW", "US", "NA", "VN", "TH", "ME", "PK", "CIS", "SAC", "BR", "BD", "EU", "EUROPE",
+]
 PREMIUM_EMOJIS = [
     "6235355429237430006", "6147815573314082674", "5350427505805238170",
     "5287267357427776826", "5222447122586036397", "5224180824789770658",
@@ -612,6 +616,36 @@ def write_json_file(path, data):
     os.replace(tmp_path, path)
 
 
+def load_telegram_users():
+    data = read_json_file(TELEGRAM_USERS_FILE, {})
+    return data if isinstance(data, dict) else {}
+
+
+def save_telegram_user_record(user_id, name=None, username=None):
+    user_id = str(user_id or "").strip()
+    if not user_id:
+        return {}
+    users = load_telegram_users()
+    current = users.get(user_id, {}) if isinstance(users.get(user_id), dict) else {}
+    record = {
+        "id": user_id,
+        "name": name or current.get("name") or user_id,
+        "username": (username or current.get("username") or "").lstrip("@"),
+    }
+    users[user_id] = record
+    write_json_file(TELEGRAM_USERS_FILE, users)
+    return record
+
+
+def get_saved_telegram_user(user_id):
+    user_id = str(user_id or "").strip()
+    if not user_id:
+        return {}
+    users = load_telegram_users()
+    record = users.get(user_id)
+    return record if isinstance(record, dict) else {}
+
+
 def load_autolike_groups():
     groups = read_json_file(AUTOLIKEFF_GROUPS_FILE, [])
     return [str(group_id) for group_id in groups]
@@ -709,7 +743,7 @@ def autolike_order_status(order):
 
 def format_autolike_order(order, title="✅ AUTOLIKEFF ORDER CREATED"):
     sent, total, remaining = autolike_order_status(order)
-    telegram_user = telegram_user_display(order.get("telegram_user_id"), html=True)
+    telegram_user = autolike_order_user_display(order, html=True)
     return "\n".join([
         title,
         "━━━━━━━━━━━━━━━━━━",
@@ -738,7 +772,7 @@ def format_autolike_list(orders):
             "",
             f"🧾 Order ID: {order.get('order_id', 'N/A')}",
             f"🆔 UID: {order.get('uid', 'N/A')}",
-            f"👤 Telegram User: {telegram_user_display(order.get('telegram_user_id'))}",
+            f"👤 Telegram User: {autolike_order_user_display(order)}",
             f"🎯 Total Likes: {total:,}",
             f"✅ Delivered: {sent:,}",
             f"⏳ Remaining: {max(0, remaining):,}",
@@ -827,21 +861,83 @@ def format_my_autolike_orders(user, orders):
     return "\n".join(lines)
 
 
-def telegram_name_by_id(user_id):
+def telegram_record_from_chat(user_id, chat):
+    first_name = getattr(chat, "first_name", None) or ""
+    last_name = getattr(chat, "last_name", None) or ""
+    full_name = " ".join(part for part in (first_name, last_name) if part).strip()
+    username = getattr(chat, "username", None) or ""
+    name = full_name or getattr(chat, "title", None) or (f"@{username}" if username else str(user_id))
+    return save_telegram_user_record(user_id, name=name, username=username)
+
+
+def telegram_user_record(user_id, chat_id=None):
+    user_id = str(user_id or "").strip()
+    if not user_id:
+        return {"id": "", "name": "User", "username": ""}
     try:
         chat = bot.get_chat(int(user_id))
-        first_name = getattr(chat, "first_name", None) or ""
-        last_name = getattr(chat, "last_name", None) or ""
-        full_name = " ".join(part for part in (first_name, last_name) if part).strip()
-        name = full_name or getattr(chat, "title", None) or getattr(chat, "username", None)
-        if name:
-            return name
+        return telegram_record_from_chat(user_id, chat)
     except Exception:
         pass
-    return str(user_id or "User")
+
+    group_ids = []
+    if chat_id:
+        group_ids.append(str(chat_id))
+    group_ids.extend(load_autolike_groups())
+    for group_id in dict.fromkeys(group_ids):
+        try:
+            member = bot.get_chat_member(int(group_id), int(user_id))
+            return telegram_record_from_chat(user_id, member.user)
+        except Exception:
+            continue
+
+    saved = get_saved_telegram_user(user_id)
+    if saved:
+        return saved
+    return {"id": user_id, "name": user_id or "User", "username": ""}
+
+
+def telegram_name_by_id(user_id):
+    return telegram_user_record(user_id).get("name") or str(user_id or "User")
 
 
 def telegram_user_display(user_id, html=False):
+    record = telegram_user_record(user_id)
+    label = record.get("name") or str(user_id or "User")
+    username = (record.get("username") or "").lstrip("@")
+    if html and username:
+        return f'<a href="https://t.me/{escape(username)}">{escape(label)}</a>'
+    if html:
+        return escape(label)
+    return label
+
+
+def autolike_order_user_record(order):
+    user_id = str(order.get("telegram_user_id") or "").strip()
+    name = order.get("telegram_user_name") or ""
+    username = (order.get("telegram_username") or "").lstrip("@")
+    if name and str(name) != user_id:
+        return {"id": user_id, "name": name, "username": username}
+    record = telegram_user_record(user_id, chat_id=order.get("group_id"))
+    if record.get("name") and record.get("name") != user_id:
+        order["telegram_user_name"] = record.get("name")
+        if record.get("username"):
+            order["telegram_username"] = record.get("username")
+    return record
+
+
+def autolike_order_user_display(order, html=False):
+    record = autolike_order_user_record(order)
+    label = record.get("name") or str(order.get("telegram_user_id") or "User")
+    username = (record.get("username") or "").lstrip("@")
+    if html and username:
+        return f'<a href="https://t.me/{escape(username)}">{escape(label)}</a>'
+    if html:
+        return escape(label)
+    return label
+
+
+def legacy_telegram_user_display(user_id, html=False):
     try:
         chat = bot.get_chat(int(user_id))
         first_name = getattr(chat, "first_name", None) or ""
@@ -879,10 +975,10 @@ def format_autolike_delivery(order, data, likes_sent, private=False):
     sent, total, remaining, progress = autolike_progress_values(order, likes_sent)
     player = data.get("PlayerNickname") or "N/A"
     uid = data.get("UID") or order.get("uid", "N/A")
-    title_name = "Your" if private else f"{telegram_name_by_id(order.get('telegram_user_id'))}"
+    title_name = "Your" if private else autolike_order_user_display(order)
     return "\n".join([
         f"💎 {title_name} Daily AutoLike Update",
-        "",
+        "━━━━━━━━━━━━━━━",
         f"🆔 UID: {uid}",
         f"👤 Player: {player}",
         "",
@@ -891,7 +987,7 @@ def format_autolike_delivery(order, data, likes_sent, private=False):
         f"➕ Likes Added: {likes_sent:,}",
         f"❤️ Current Likes: {data.get('LikesafterCommand', 'N/A')}",
         f"🎯 Total Delivered: {sent}/{total}",
-        "",
+        "━━━━━━━━━━━━━━━",
         "📌 Status",
         f"📈 Progress: {progress:.2f}%",
         f"⏳ Remaining: {max(0, remaining)}",
@@ -1094,10 +1190,18 @@ def remember_user(user):
     if not user:
         return
     username = getattr(user, "username", None)
+    first_name = getattr(user, "first_name", "") or getattr(user, "full_name", "") or username or str(getattr(user, "id", ""))
+    last_name = getattr(user, "last_name", "") or ""
+    full_name = " ".join(part for part in (first_name, last_name) if part).strip()
+    if getattr(user, "id", None):
+        try:
+            save_telegram_user_record(user.id, name=full_name, username=username)
+        except Exception as exc:
+            logger.warning("Could not save Telegram user %s: %s", getattr(user, "id", None), exc)
     if username:
         seen_users_db[username.lower()] = SimpleNamespace(
             id=user.id,
-            first_name=getattr(user, "first_name", "") or getattr(user, "full_name", "") or username,
+            first_name=full_name or username,
             username=username,
             is_bot=getattr(user, "is_bot", False),
         )
@@ -2204,6 +2308,16 @@ def format_guestgen(data):
     ])
 
 
+def guestgen_usage_message():
+    return "\n".join([
+        "⚠️ Invalid format.",
+        "━━━━━━━━━━━━━━━━━━",
+        "📌 Use: /guestgen <region> <name> [total]",
+        "",
+        f"🌍 Supported Regions: {', '.join(GUESTGEN_SUPPORTED_REGIONS)}",
+    ])
+
+
 def format_bio_update(data, bio):
     def v(value):
         return escape(str(value if value not in (None, "") else "N/A"))
@@ -2334,7 +2448,9 @@ def autolikeff_command(message):
     if len(parts) == 2 and parts[1].lower() in {"ls", "list"}:
         with autolike_lock:
             orders = load_autolike_orders()
-        send_long_message(message, format_autolike_list(orders), parse_mode=None)
+            text = format_autolike_list(orders)
+            save_autolike_orders(orders)
+        send_long_message(message, text, parse_mode=None)
         return
 
     if len(parts) == 2 and parts[1].lower() in {"summary", "data", "stats"}:
@@ -2389,6 +2505,7 @@ def autolikeff_command(message):
 
     now_text = datetime.now(CAMBODIA_TZ).strftime("%d %b %Y %H:%M:%S")
     group_id = resolve_autolike_group_id(message)
+    telegram_user = telegram_user_record(telegram_user_id, chat_id=group_id)
     with autolike_lock:
         orders = load_autolike_orders()
         existing_order = find_existing_autolike_order(orders, uid)
@@ -2411,6 +2528,8 @@ def autolikeff_command(message):
             "total_likes": total_likes,
             "sent_likes": 0,
             "telegram_user_id": telegram_user_id,
+            "telegram_user_name": "" if telegram_user.get("name") == telegram_user_id else (telegram_user.get("name") or ""),
+            "telegram_username": telegram_user.get("username") or "",
             "group_id": group_id,
             "created_by": str(message.from_user.id),
             "created_at": now_text,
@@ -2427,7 +2546,7 @@ def autolikeff_command(message):
         "━━━━━━━━━━━━━━━━━━",
         f"🧾 Order ID: {order.get('order_id', 'N/A')}",
         f"🆔 UID: {uid}",
-        f"👤 Telegram User: {telegram_user_display(telegram_user_id, html=True)}",
+        f"👤 Telegram User: {autolike_order_user_display(order, html=True)}",
         f"🎯 Total Likes: {total_likes:,}",
         "⏳ First delivery is processing now.",
     ])
@@ -2656,7 +2775,10 @@ def guestgen_command(message):
         return
     args = message.text.split()
     if len(args) not in {3, 4} or not args[1].isalpha():
-        bot.reply_to(message, "⚠️ Invalid format.\n📌 Use: /guestgen <region> <name> [total]", parse_mode=None)
+        bot.reply_to(message, guestgen_usage_message(), parse_mode=None)
+        return
+    if args[1].upper() not in GUESTGEN_SUPPORTED_REGIONS:
+        bot.reply_to(message, guestgen_usage_message(), parse_mode=None)
         return
     total = None
     file_mode = False

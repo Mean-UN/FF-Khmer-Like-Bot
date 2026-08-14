@@ -508,15 +508,11 @@ def generate_custom_password(user_prefix):
 def major_register_url(region, is_ghost=False):
     if is_ghost:
         return "https://loginbp.ggblueshark.com/MajorRegister"
-    if region.upper() in {"ME", "TH"}:
-        return "https://loginbp.common.ggbluefox.com/MajorRegister"
     return "https://loginbp.ggblueshark.com/MajorRegister"
 
 def major_login_url(region, is_ghost=False):
     if is_ghost:
         return "https://loginbp.ggblueshark.com/MajorLogin"
-    if region.upper() in {"ME", "TH"}:
-        return "https://loginbp.common.ggbluefox.com/MajorLogin"
     return "https://loginbp.ggblueshark.com/MajorLogin"
 
 def get_region_proxies(region):
