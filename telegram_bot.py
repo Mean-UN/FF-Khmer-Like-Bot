@@ -66,6 +66,7 @@ AUTOLIKEFF_ORDER_DELAY = 30
 AUTOLIKEFF_ORDERS_FILE = os.path.join(BASE_DIR, "autolikeff_orders.json")
 AUTOLIKEFF_GROUPS_FILE = os.path.join(BASE_DIR, "autolikeff_groups.json")
 TELEGRAM_USERS_FILE = os.path.join(BASE_DIR, "telegram_users.json")
+REGIONS_FILE = os.path.join(BASE_DIR, "regions.json")
 GUESTGEN_SUPPORTED_REGIONS = [
     "IND", "SG", "RU", "ID", "TW", "US", "NA", "VN", "TH", "ME", "PK", "CIS", "SAC", "BR", "BD", "EU", "EUROPE",
 ]
@@ -413,7 +414,7 @@ def call_api(endpoint, params, timeout=120):
 
 
 def cached_region_for_uid(uid):
-    cache = read_json_file(os.path.join(BASE_DIR, "regions.json"), {})
+    cache = load_region_cache()
     item = cache.get(str(uid))
     if isinstance(item, dict):
         region = item.get("region") or item.get("Region")
@@ -644,6 +645,74 @@ def get_saved_telegram_user(user_id):
     users = load_telegram_users()
     record = users.get(user_id)
     return record if isinstance(record, dict) else {}
+
+
+def load_region_cache():
+    data = read_json_file(REGIONS_FILE, {})
+    return data if isinstance(data, dict) else {}
+
+
+def save_region_cache(data):
+    write_json_file(REGIONS_FILE, data)
+
+
+def remember_like_success(uid, when=None):
+    uid = str(uid or "").strip()
+    if not uid:
+        return
+    when = when or datetime.now(CAMBODIA_TZ)
+    cache = load_region_cache()
+    item = cache.get(uid)
+    if isinstance(item, dict):
+        item["last_like_sent_at"] = when.isoformat()
+    else:
+        item = {
+            "region": item,
+            "last_like_sent_at": when.isoformat(),
+        }
+    cache[uid] = item
+    save_region_cache(cache)
+
+
+def next_like_time_for_uid(uid):
+    item = load_region_cache().get(str(uid or "").strip())
+    raw = item.get("last_like_sent_at") if isinstance(item, dict) else None
+    if not raw:
+        return None
+    try:
+        last_sent = datetime.fromisoformat(str(raw))
+    except ValueError:
+        return None
+    if last_sent.tzinfo is None:
+        last_sent = last_sent.replace(tzinfo=CAMBODIA_TZ)
+    return last_sent.astimezone(CAMBODIA_TZ) + timedelta(hours=24)
+
+
+def format_next_like_time(uid):
+    next_time = next_like_time_for_uid(uid)
+    if not next_time:
+        return "N/A"
+    return next_time.strftime("%d %b %Y %H:%M:%S")
+
+
+def format_next_like_wait(uid, now=None):
+    next_time = next_like_time_for_uid(uid)
+    if not next_time:
+        return "Please try another UID."
+    now = now or datetime.now(CAMBODIA_TZ)
+    seconds = int((next_time - now).total_seconds())
+    if seconds <= 0:
+        return "Please try another UID."
+    hours, remainder = divmod(seconds, 3600)
+    minutes = max(1, remainder // 60) if hours == 0 else round(remainder / 60)
+    if minutes >= 60:
+        hours += 1
+        minutes = 0
+    if hours > 0 and minutes > 0:
+        return f"Try another UID or try again in {hours}h {minutes}m."
+    if hours > 0:
+        return f"Try another UID or try again in {hours}h."
+    return f"Try another UID or try again in {minutes}m."
 
 
 def load_autolike_groups():
@@ -1527,15 +1596,10 @@ def process_like(message, endpoint, uid, region=None):
         likes_added = 0
     if likes_added <= 0:
         owner_contact = owner_contact_text()
+        next_like_wait = format_next_like_wait(data.get("UID") or uid, now)
         text = "\n".join([
-            "⚠️ UID Already Reached Max Likes For Now.",
-            "━━━━━━━━━━━━━━━━━━",
-            f"👤 Name: {data.get('PlayerNickname', 'N/A')}",
-            f"🆔 UID: {data.get('UID', uid)}",
-            f"🌍 Region: {data.get('Region', 'N/A')}",
-            f"👍 Likes Before: {data.get('LikesbeforeCommand', 'N/A')}",
-            f"➕ Likes Added: {likes_added}",
-            f"❤️ Total Now: {data.get('LikesafterCommand', 'N/A')}",
+            "❌ This UID Already Received Maximum Free Likes In Last 24 Hours.",
+            f"⏳ {next_like_wait}",
             "━━━━━━━━━━━━━━━━━━",
             "💥 Daily 220 Likes!",
             f"🚀 Contact {owner_contact} to purchase Likes.",
@@ -1543,6 +1607,8 @@ def process_like(message, endpoint, uid, region=None):
         bot.edit_message_text(chat_id=status_msg.chat.id, message_id=status_msg.message_id, text=text, parse_mode=None)
         return
 
+    response_uid = data.get("UID") or uid
+    remember_like_success(response_uid, now)
     usage["used"] += 1
     usage["last_used"] = now
     usage_tracker[user_id] = usage
@@ -1552,7 +1618,7 @@ def process_like(message, endpoint, uid, region=None):
         "✅ Like Request Processed Successfully",
         "━━━━━━━━━━━━━━━━━━",
         f"👤 Name: {data.get('PlayerNickname', 'N/A')}",
-        f"🆔 UID: {data.get('UID', uid)}",
+        f"🆔 UID: {response_uid}",
         f"🌍 Region: {data.get('Region', 'N/A')}",
         f"👍 Likes Before: {data.get('LikesbeforeCommand', 'N/A')}",
         f"➕ Likes Added: {likes_added}",
@@ -2296,9 +2362,9 @@ def format_guestgen(data):
     return "\n".join([
         "✅ <b>Guest account generated</b>",
         "━━━━━━━━━━━━━━━━━━",
-        f"🌐 <b>Region:</b> {v(region)}",
+        f"🆔 <b>Account ID:</b> <code>{v(account_id)}</code>",
         f"👤 <b>Name:</b> {v(name)}",
-        f"🆔 <b>Account ID:</b> {v(account_id)}",
+        f"🌐 <b>Region:</b> {v(region)}",
         "",
         f"🎮 <b>UID:</b> <code>{v(uid)}</code>",
         f"🔐 <b>Password:</b> <code>{v(password)}</code>",
@@ -2690,17 +2756,14 @@ def jwt_command(message):
 
 
 def guest_account_record(data):
-    record = {
-        "region": data.get("region") or data.get("requested_region"),
+    return {
+        "account_id": data.get("account_id"),
         "name": data.get("name"),
+        "region": data.get("region") or data.get("requested_region"),
         "uid": data.get("uid"),
         "password": data.get("password"),
         "access_token": data.get("access_token"),
     }
-    account_id = data.get("account_id")
-    if account_id not in (None, "", "null"):
-        record["account_id"] = account_id
-    return record
 
 
 def process_guestgen(message, region, name, total=None, file_mode=False):
