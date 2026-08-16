@@ -2690,15 +2690,17 @@ def jwt_command(message):
 
 
 def guest_account_record(data):
-    return {
+    record = {
         "region": data.get("region") or data.get("requested_region"),
         "name": data.get("name"),
-        "account_id": data.get("account_id"),
         "uid": data.get("uid"),
         "password": data.get("password"),
         "access_token": data.get("access_token"),
-        "jwt_token": data.get("jwt_token"),
     }
+    account_id = data.get("account_id")
+    if account_id not in (None, "", "null"):
+        record["account_id"] = account_id
+    return record
 
 
 def process_guestgen(message, region, name, total=None, file_mode=False):
@@ -2706,17 +2708,23 @@ def process_guestgen(message, region, name, total=None, file_mode=False):
     accounts = []
     failures = []
     total = total or 1
+    attempts = 0
+    max_attempts = max(total * 5, total + 5)
 
-    for index in range(total):
+    while len(accounts) < total and attempts < max_attempts:
+        attempts += 1
         if total > 1:
             bot.edit_message_text(
                 chat_id=status_msg.chat.id,
                 message_id=status_msg.message_id,
-                text=f"⏳ Generating guest accounts...\n━━━━━━━━━━━━━━━━━━\n📦 Progress: {index + 1}/{total}",
+                text=f"⏳ Generating guest accounts...\n━━━━━━━━━━━━━━━━━━\n📦 Progress: {len(accounts)}/{total}\n🔁 Attempt: {attempts}/{max_attempts}",
                 parse_mode=None,
             )
         data = call_api("createaccount", {"region": region, "name": name})
         if data.get("success") and not data.get("error"):
+            if data.get("account_id") in (None, "", "null"):
+                failures.append("Generated account skipped because account_id is missing")
+                continue
             accounts.append(guest_account_record(data))
         else:
             failures.append(data.get("error") or data.get("warning") or "Guest account generation failed")
