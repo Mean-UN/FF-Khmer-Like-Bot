@@ -853,12 +853,14 @@ def format_autolike_list(orders):
 
 def format_autolike_summary(orders):
     total_orders = len(orders)
-    completed_orders = sum(1 for order in orders if order.get("status") == "completed")
+    completed_orders = 0
     total_likes = 0
     delivered_likes = 0
     remaining_likes = 0
     for order in orders:
         sent, total, remaining = autolike_order_status(order)
+        if order.get("status") == "completed" or (total > 0 and sent >= total):
+            completed_orders += 1
         total_likes += total
         delivered_likes += sent
         remaining_likes += max(0, remaining)
