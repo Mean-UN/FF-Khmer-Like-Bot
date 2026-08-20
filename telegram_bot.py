@@ -40,6 +40,7 @@ def load_local_env(path=".env"):
 load_local_env()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+LIKE_BOT_TOKEN = os.getenv("LIKE_BOT_TOKEN", "").strip()
 API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:5000").rstrip("/")
 OWNER_ID = int(os.getenv("OWNER_ID", "0") or 0)
 TELEGRAM_PROXY = os.getenv("TELEGRAM_PROXY", "").strip()
@@ -111,6 +112,7 @@ if TELEGRAM_PROXY:
     logger.info("Telegram proxy configured")
 
 bot = telebot.TeleBot(BOT_TOKEN)
+user_bot = telebot.TeleBot(LIKE_BOT_TOKEN) if LIKE_BOT_TOKEN and LIKE_BOT_TOKEN != BOT_TOKEN else None
 INSTANCE_LOCK_SOCKET = None
 usage_tracker = {}
 chat_title_cache = {}
@@ -129,6 +131,22 @@ flood_db = {}
 afk_db = {}
 spam_track = {}
 autolike_lock = threading.Lock()
+
+
+def active_bot_for(message):
+    return getattr(message, "_active_bot", bot)
+
+
+def command_belongs_to_other_bot(message, active_bot=None):
+    if not user_bot:
+        return False
+    active_bot = active_bot or active_bot_for(message)
+    owner = is_owner(message.from_user.id)
+    if active_bot is bot:
+        return not owner
+    if active_bot is user_bot:
+        return owner
+    return False
 
 MAX_WARNS = 3
 FLOOD_LIMIT = 5
@@ -344,13 +362,14 @@ def channel_url(channel):
     return f"https://t.me/{str(channel).lstrip('@')}"
 
 
-def required_membership_status(user_id):
+def required_membership_status(user_id, active_bot=None):
+    active_bot = active_bot or bot
     if not REQUIRED_CHANNELS:
         return True, []
     missing = []
     for channel in REQUIRED_CHANNELS:
         try:
-            member = bot.get_chat_member(channel, user_id)
+            member = active_bot.get_chat_member(channel, user_id)
             if member.status not in {"member", "administrator", "creator"}:
                 missing.append(channel)
         except Exception as exc:
@@ -359,8 +378,8 @@ def required_membership_status(user_id):
     return not missing, missing
 
 
-def is_user_in_channels(user_id):
-    ok, _ = required_membership_status(user_id)
+def is_user_in_channels(user_id, active_bot=None):
+    ok, _ = required_membership_status(user_id, active_bot=active_bot)
     return ok
 
 
@@ -1175,14 +1194,15 @@ def deliver_autolikeff_order_now(order_id):
         merge_save_autolike_orders([target_order])
 
 
-def check_access(message):
+def check_access(message, active_bot=None):
+    active_bot = active_bot or active_bot_for(message)
     user_id = message.from_user.id
     if message.chat.type == "private" and user_id != OWNER_ID:
-        bot.reply_to(message, "⚠️ Group access required.\n📌 Use this bot in the official group.", reply_markup=join_markup(), parse_mode=None)
+        active_bot.reply_to(message, "⚠️ Group access required.\n📌 Use this bot in the official group.", reply_markup=join_markup(), parse_mode=None)
         return False
-    ok, missing = required_membership_status(user_id)
+    ok, missing = required_membership_status(user_id, active_bot=active_bot)
     if not ok:
-        bot.reply_to(message, "⚠️ Join required.\n📌 You must join the required channel(s) first.", reply_markup=join_markup(missing), parse_mode=None)
+        active_bot.reply_to(message, "⚠️ Join required.\n📌 You must join the required channel(s) first.", reply_markup=join_markup(missing), parse_mode=None)
         return False
     return True
 
@@ -1362,17 +1382,19 @@ def normal_permissions():
     )
 
 
-def safe_delete(chat_id, message_id):
+def safe_delete(chat_id, message_id, active_bot=None):
+    active_bot = active_bot or bot
     try:
-        bot.delete_message(chat_id, message_id)
+        active_bot.delete_message(chat_id, message_id)
         return True
     except Exception:
         return False
 
 
 def safe_reply(message, text, **kwargs):
+    active_bot = kwargs.pop("active_bot", None) or active_bot_for(message)
     try:
-        return bot.reply_to(message, text, **kwargs)
+        return active_bot.reply_to(message, text, **kwargs)
     except ApiTelegramException as exc:
         logger.error("Telegram send failed: %s", exc)
         return None
@@ -1391,18 +1413,21 @@ def warn_user(chat_id, user, reason="No reason"):
 
 @bot.message_handler(commands=["start"])
 def start_command(message):
-    ok, missing = required_membership_status(message.from_user.id)
+    active_bot = active_bot_for(message)
+    if command_belongs_to_other_bot(message, active_bot):
+        return
+    ok, missing = required_membership_status(message.from_user.id, active_bot=active_bot)
     if not ok:
-        bot.reply_to(message, "⚠️ Join the required channel(s) first, then press Try again.", reply_markup=join_markup(missing))
+        active_bot.reply_to(message, "⚠️ Join the required channel(s) first, then press Try again.", reply_markup=join_markup(missing))
         return
     markup = InlineKeyboardMarkup()
     try:
-        username = bot.get_me().username
+        username = active_bot.get_me().username
         markup.add(InlineKeyboardButton("Add to Group", url=f"https://t.me/{username}?startgroup=true"))
     except Exception:
         pass
     markup.add(InlineKeyboardButton("Commands", callback_data="help_main"))
-    bot.reply_to(
+    active_bot.reply_to(
         message,
         f"✅ Ready, {message.from_user.first_name}.\n📌 Use /help for all commands or /ffinfo <uid> for Free Fire info.",
         reply_markup=markup,
@@ -1412,18 +1437,21 @@ def start_command(message):
 
 @bot.callback_query_handler(func=lambda call: call.data == "verify_join")
 def verify_join_callback(call):
-    ok, missing = required_membership_status(call.from_user.id)
+    active_bot = active_bot_for(call)
+    if command_belongs_to_other_bot(call, active_bot):
+        return
+    ok, missing = required_membership_status(call.from_user.id, active_bot=active_bot)
     if ok:
-        bot.answer_callback_query(call.id, "✅ Verified")
-        bot.edit_message_text(
+        active_bot.answer_callback_query(call.id, "✅ Verified")
+        active_bot.edit_message_text(
             "✅ Verification complete. You can use the bot now.",
             chat_id=call.message.chat.id,
             message_id=call.message.message_id,
             reply_markup=None,
         )
         return
-    bot.answer_callback_query(call.id, "⚠️ Not verified yet. Join all required chats first.", show_alert=True)
-    bot.edit_message_reply_markup(
+    active_bot.answer_callback_query(call.id, "⚠️ Not verified yet. Join all required chats first.", show_alert=True)
+    active_bot.edit_message_reply_markup(
         chat_id=call.message.chat.id,
         message_id=call.message.message_id,
         reply_markup=join_markup(missing),
@@ -1432,52 +1460,110 @@ def verify_join_callback(call):
 
 @bot.callback_query_handler(func=lambda call: call.data == "help_main")
 def help_callback(call):
-    bot.answer_callback_query(call.id)
-    help_text = build_help_text(call.message.chat.id, call.from_user.id)
-    bot.send_message(call.message.chat.id, help_text, parse_mode=None)
+    active_bot = active_bot_for(call)
+    if command_belongs_to_other_bot(call, active_bot):
+        return
+    active_bot.answer_callback_query(call.id)
+    page = default_help_page(call.from_user.id)
+    help_text = build_help_text(call.message.chat.id, call.from_user.id, active_bot=active_bot, page=page)
+    active_bot.send_message(call.message.chat.id, help_text, reply_markup=build_help_markup(call.message.chat.id, call.from_user.id, page), parse_mode=None)
+
+
+@bot.callback_query_handler(func=lambda call: str(call.data or "").startswith("help_page:"))
+def help_page_callback(call):
+    active_bot = active_bot_for(call)
+    if command_belongs_to_other_bot(call, active_bot):
+        return
+    page = str(call.data or "").split(":", 1)[1] or "main"
+    active_bot.answer_callback_query(call.id)
+    active_bot.edit_message_text(
+        build_help_text(call.message.chat.id, call.from_user.id, active_bot=active_bot, page=page),
+        chat_id=call.message.chat.id,
+        message_id=call.message.message_id,
+        reply_markup=build_help_markup(call.message.chat.id, call.from_user.id, page),
+        parse_mode=None,
+    )
 
 
 @bot.message_handler(commands=["help"])
 def help_command(message):
-    safe_reply(message, build_help_text(message.chat.id, message.from_user.id), parse_mode=None)
+    active_bot = active_bot_for(message)
+    if command_belongs_to_other_bot(message, active_bot):
+        return
+    page = default_help_page(message.from_user.id)
+    safe_reply(
+        message,
+        build_help_text(message.chat.id, message.from_user.id, active_bot=active_bot, page=page),
+        reply_markup=build_help_markup(message.chat.id, message.from_user.id, page),
+        parse_mode=None,
+        active_bot=active_bot,
+    )
 
 
-def build_help_text(chat_id=None, user_id=None):
+def default_help_page(user_id=None):
+    return "owner" if is_owner(user_id) else "main"
+
+
+def build_help_markup(chat_id=None, user_id=None, page="main"):
+    admin_view = bool(chat_id and user_id and is_admin(chat_id, user_id))
+    owner_view = is_owner(user_id)
+    markup = InlineKeyboardMarkup()
+    if page == "main":
+        buttons = []
+        if owner_view:
+            buttons.append(InlineKeyboardButton("👑 Owner", callback_data="help_page:owner"))
+        if admin_view:
+            buttons.append(InlineKeyboardButton("🛡 Admin", callback_data="help_page:admin"))
+        if buttons:
+            markup.row(*buttons)
+    elif page == "admin":
+        buttons = [InlineKeyboardButton("⬅️ Free Fire", callback_data="help_page:main")]
+        if owner_view:
+            buttons.append(InlineKeyboardButton("👑 Owner", callback_data="help_page:owner"))
+        markup.row(*buttons)
+    elif page == "owner":
+        buttons = [InlineKeyboardButton("⬅️ Free Fire", callback_data="help_page:main")]
+        if admin_view:
+            buttons.append(InlineKeyboardButton("🛡 Admin", callback_data="help_page:admin"))
+        markup.row(*buttons)
+    return markup if markup.keyboard else None
+
+
+def build_help_text(chat_id=None, user_id=None, active_bot=None, page="main"):
+    active_bot = active_bot or bot
     try:
-        bot_name = bot.get_me().first_name
+        bot_name = active_bot.get_me().first_name
     except Exception:
         bot_name = "Bot"
     admin_view = bool(chat_id and user_id and is_admin(chat_id, user_id))
-    lines = [
-        f"📖 {bot_name} COMMAND CENTER",
-        "━━━━━━━━━━━━━━━━━━",
-        "",
-        "🎮 FREE FIRE",
-        "━━━━━━━━━━━━━━━━━━",
-        "❤️ /like <uid> - Send likes to a player",
-        "💎 /likeff <uid> - Send premium like",
-        "👤 /ffinfo <uid> - View full player profile",
-        "📊 /level <uid> - Check level EXP progress",
-        "🌍 /region <uid> - Check player region",
-        "📦 /myautolike - View your AutoLikeFF orders",
-        "📝 /bio <access_token|jwt|uidpass> <new_bio> - Update profile bio",
-    ]
-    if is_owner(user_id):
-        lines.extend([
-            "🎟 /jwt <uid> <password> - Generate/check JWT token",
-            "🧾 /guestgen <region> <name> [total] - Create guest account(s)",
-            "💎 /autolikeff <uid> <total_likes> <telegram_user_id> - Create AutoLikeFF order",
-            "📋 /autolikeff ls - List AutoLikeFF orders",
-            "📊 /autolikeff summary - View AutoLikeFF totals",
-            "🗑 /autolikeff del <uid> - Remove AutoLikeFF order",
-            "➕ /extend <uid> <extra_likes> - Extend AutoLikeFF order",
-            "🏷 /autolikegroup <set|del|ls> [group_id] - Manage AutoLikeFF groups",
-            "📦 /uidpass <ls|add|set|del|up> - Manage like accounts",
-            "📦 /uidpassff <ls|add|set|del|up> - Manage likeff accounts",
-            "⏳ /remain - Check daily request usage",
-        ])
-    if admin_view:
-        lines.extend([
+    owner_view = is_owner(user_id)
+
+    if page == "admin" and not admin_view:
+        page = "owner" if owner_view else "main"
+    if page == "owner" and not owner_view:
+        page = "admin" if admin_view else "main"
+
+    if page == "main":
+        lines = [
+            f"📖 {bot_name} COMMAND CENTER",
+            "━━━━━━━━━━━━━━━━━━",
+            "",
+            "🎮 FREE FIRE",
+            "━━━━━━━━━━━━━━━━━━",
+            "❤️ /like <uid> - Send likes to a player",
+            "💎 /likeff <uid> - Send premium like",
+            "👤 /ffinfo <uid> - View full player profile",
+            "📊 /level <uid> - Check level EXP progress",
+            "🌍 /region <uid> - Check player region",
+            "📦 /myautolike - View your AutoLikeFF orders",
+            "📝 /bio <access_token|jwt|uidpass> <new_bio> - Update profile bio",
+        ]
+        return "\n".join(lines)
+
+    if page == "admin":
+        lines = [
+            f"📖 {bot_name} ADMIN CENTER",
+            "━━━━━━━━━━━━━━━━━━",
             "",
             "🛡 ADMIN COMMANDS",
             "━━━━━━━━━━━━━━━━━━",
@@ -1521,9 +1607,26 @@ def build_help_text(chat_id=None, user_id=None):
             "🌙 AFK",
             "━━━━━━━━━━━━━━━━━━",
             "💤 /afk <reason>, /brb <reason>",
-        ])
-    if is_owner(user_id):
-        lines.extend([
+        ]
+        return "\n".join(lines)
+
+    lines = [
+            f"📖 {bot_name} OWNER CENTER",
+            "━━━━━━━━━━━━━━━━━━",
+            "",
+            "💎 AUTOLIKEFF OWNER",
+            "━━━━━━━━━━━━━━━━━━",
+            "🎟 /jwt <uid> <password> - Generate/check JWT token",
+            "🧾 /guestgen <region> <name> [total] - Create guest account(s)",
+            "💎 /autolikeff <uid> <total_likes> <telegram_user_id> - Create AutoLikeFF order",
+            "📋 /autolikeff ls - List AutoLikeFF orders",
+            "📊 /autolikeff summary - View AutoLikeFF totals",
+            "🗑 /autolikeff del <uid> - Remove AutoLikeFF order",
+            "➕ /extend <uid> <extra_likes> - Extend AutoLikeFF order",
+            "🏷 /autolikegroup <set|del|ls> [group_id] - Manage AutoLikeFF groups",
+            "📦 /uidpass <ls|add|set|del|up> - Manage like accounts",
+            "📦 /uidpassff <ls|add|set|del|up> - Manage likeff accounts",
+            "⏳ /remain - Check daily request usage",
             "",
             "👑 OWNER INFO",
             "━━━━━━━━━━━━━━━━━━",
@@ -1537,11 +1640,12 @@ def build_help_text(chat_id=None, user_id=None):
             "🏓 /ping",
             "🕒 /time",
             "🧮 /calc <math>",
-        ])
+        ]
     return "\n".join(lines)
 
 
-def process_like(message, endpoint, uid, region=None):
+def process_like(message, endpoint, uid, region=None, active_bot=None):
+    active_bot = active_bot or active_bot_for(message)
     user_id = message.from_user.id
     now = datetime.now(CAMBODIA_TZ)
     usage = usage_tracker.get(user_id, {"used": 0, "last_used": now - timedelta(days=1)})
@@ -1550,10 +1654,10 @@ def process_like(message, endpoint, uid, region=None):
 
     limit = get_user_limit(user_id)
     if usage["used"] >= limit:
-        bot.reply_to(message, "⛔ Daily request limit reached.\n━━━━━━━━━━━━━━━━━━\n📌 Please try again tomorrow.", parse_mode=None)
+        active_bot.reply_to(message, "⛔ Daily request limit reached.\n━━━━━━━━━━━━━━━━━━\n📌 Please try again tomorrow.", parse_mode=None)
         return
 
-    status_msg = bot.reply_to(
+    status_msg = active_bot.reply_to(
         message,
         "⏳ Processing like request...",
         parse_mode=None,
@@ -1561,7 +1665,7 @@ def process_like(message, endpoint, uid, region=None):
     resolved_region, region_source = resolve_like_region(uid, region)
     if region and not resolved_region:
         error_text = "Request timeout. Please try again later." if region_source == "timeout" else "User not found or region is incorrect."
-        bot.edit_message_text(
+        active_bot.edit_message_text(
             chat_id=status_msg.chat.id,
             message_id=status_msg.message_id,
             text=f"❌ LIKE REQUEST FAILED\n━━━━━━━━━━━━━━━━━━\n{error_text}",
@@ -1584,7 +1688,7 @@ def process_like(message, endpoint, uid, region=None):
             error_text = "User not found or region is incorrect."
         elif "timeout" in error_text.lower() or "timed out" in error_text.lower():
             error_text = "Request timeout. Please try again later."
-        bot.edit_message_text(
+        active_bot.edit_message_text(
             chat_id=status_msg.chat.id,
             message_id=status_msg.message_id,
             text=f"❌ LIKE REQUEST FAILED\n━━━━━━━━━━━━━━━━━━\n{error_text}",
@@ -1606,7 +1710,7 @@ def process_like(message, endpoint, uid, region=None):
             "💥 Daily 220 Likes!",
             f"🚀 Contact {owner_contact} to purchase Likes.",
         ])
-        bot.edit_message_text(chat_id=status_msg.chat.id, message_id=status_msg.message_id, text=text, parse_mode=None)
+        active_bot.edit_message_text(chat_id=status_msg.chat.id, message_id=status_msg.message_id, text=text, parse_mode=None)
         return
 
     response_uid = data.get("UID") or uid
@@ -1630,11 +1734,12 @@ def process_like(message, endpoint, uid, region=None):
         "💥 Daily 220 Likes!",
         f"🚀 Contact {owner_contact} to purchase Likes.",
     ])
-    bot.edit_message_text(chat_id=status_msg.chat.id, message_id=status_msg.message_id, text=text, parse_mode=None)
+    active_bot.edit_message_text(chat_id=status_msg.chat.id, message_id=status_msg.message_id, text=text, parse_mode=None)
 
 
-def handle_like_command(message, endpoint):
-    if not check_access(message):
+def handle_like_command(message, endpoint, active_bot=None):
+    active_bot = active_bot or active_bot_for(message)
+    if not check_access(message, active_bot=active_bot):
         return
     args = message.text.split()
     usage = "\n".join([
@@ -1649,12 +1754,12 @@ def handle_like_command(message, endpoint):
         region = args[1].upper()
         uid = args[2]
     else:
-        bot.reply_to(message, usage, parse_mode=None)
+        active_bot.reply_to(message, usage, parse_mode=None)
         return
     if not uid.isdigit():
-        bot.reply_to(message, f"⚠️ Invalid UID.\n━━━━━━━━━━━━━━━━━━\n{usage}", parse_mode=None)
+        active_bot.reply_to(message, f"⚠️ Invalid UID.\n━━━━━━━━━━━━━━━━━━\n{usage}", parse_mode=None)
         return
-    threading.Thread(target=process_like, args=(message, endpoint, uid, region), daemon=True).start()
+    threading.Thread(target=process_like, args=(message, endpoint, uid, region, active_bot), daemon=True).start()
 
 
 def pick(data, *keys, default="N/A"):
@@ -2404,13 +2509,14 @@ def format_bio_update(data, bio):
     ])
 
 
-def send_long_message(message, text, parse_mode=None):
+def send_long_message(message, text, parse_mode=None, active_bot=None):
+    active_bot = active_bot or active_bot_for(message)
     chunks = []
     while text:
         chunks.append(text[:3900])
         text = text[3900:]
     for chunk in chunks:
-        bot.reply_to(message, chunk, parse_mode=parse_mode)
+        active_bot.reply_to(message, chunk, parse_mode=parse_mode)
 
 
 def owner_contact_text():
@@ -2448,23 +2554,32 @@ def format_likeff_price_list():
 
 @bot.message_handler(commands=["like"])
 def like_command(message):
-    handle_like_command(message, "like")
+    active_bot = active_bot_for(message)
+    if command_belongs_to_other_bot(message, active_bot):
+        return
+    handle_like_command(message, "like", active_bot=active_bot)
 
 
 @bot.message_handler(commands=["likeff"])
 def likeff_command(message):
-    if not OWNER_ID or message.from_user.id != OWNER_ID:
-        bot.reply_to(message, format_likeff_price_list(), parse_mode=None)
+    active_bot = active_bot_for(message)
+    if command_belongs_to_other_bot(message, active_bot):
         return
-    handle_like_command(message, "likeff")
+    if not OWNER_ID or message.from_user.id != OWNER_ID:
+        active_bot.reply_to(message, format_likeff_price_list(), parse_mode=None)
+        return
+    handle_like_command(message, "likeff", active_bot=active_bot)
 
 
 @bot.message_handler(commands=["myautolike"])
 def myautolike_command(message):
+    active_bot = active_bot_for(message)
+    if command_belongs_to_other_bot(message, active_bot):
+        return
     with autolike_lock:
         orders = load_autolike_orders()
     text = format_my_autolike_orders(message.from_user, orders)
-    send_long_message(message, text, parse_mode=None)
+    send_long_message(message, text, parse_mode=None, active_bot=active_bot)
 
 
 @bot.message_handler(commands=["autolikegroup"])
@@ -2667,22 +2782,26 @@ def extend_autolikeff_command(message):
 
 @bot.message_handler(commands=["ffinfo"])
 def ffinfo_command(message):
+    active_bot = active_bot_for(message)
+    if command_belongs_to_other_bot(message, active_bot):
+        return
     args = message.text.split()
     if len(args) != 2 or not args[1].isdigit():
-        bot.reply_to(message, "⚠️ Invalid format.\n📌 Use: /ffinfo <uid>", parse_mode=None)
+        active_bot.reply_to(message, "⚠️ Invalid format.\n📌 Use: /ffinfo <uid>", parse_mode=None)
         return
-    threading.Thread(target=process_ffinfo, args=(message, args[1]), daemon=True).start()
+    threading.Thread(target=process_ffinfo, args=(message, args[1], active_bot), daemon=True).start()
 
 
-def process_ffinfo(message, uid):
-    status_msg = bot.reply_to(
+def process_ffinfo(message, uid, active_bot=None):
+    active_bot = active_bot or active_bot_for(message)
+    status_msg = active_bot.reply_to(
         message,
         "⏳ Loading Free Fire profile...",
         parse_mode=None,
     )
     data = call_api("meanffinfo", {"uid": uid}, timeout=180)
     if "error" in data:
-        bot.edit_message_text(
+        active_bot.edit_message_text(
             chat_id=status_msg.chat.id,
             message_id=status_msg.message_id,
             text=f"❌ FFINFO FAILED\n━━━━━━━━━━━━━━━━━━\n{data['error']}",
@@ -2691,31 +2810,35 @@ def process_ffinfo(message, uid):
         return
     requested_by = requester_name(message.from_user)
     text = format_ff_player_information(data, requested_by)
-    bot.edit_message_text(chat_id=status_msg.chat.id, message_id=status_msg.message_id, text=text[:3900], parse_mode="HTML")
+    active_bot.edit_message_text(chat_id=status_msg.chat.id, message_id=status_msg.message_id, text=text[:3900], parse_mode="HTML")
     extra = text[3900:]
     while extra:
-        bot.send_message(status_msg.chat.id, extra[:3900], parse_mode="HTML")
+        active_bot.send_message(status_msg.chat.id, extra[:3900], parse_mode="HTML")
         extra = extra[3900:]
 
 
 @bot.message_handler(commands=["level"])
 def level_command(message):
+    active_bot = active_bot_for(message)
+    if command_belongs_to_other_bot(message, active_bot):
+        return
     args = message.text.split()
     if len(args) != 2 or not args[1].isdigit():
-        bot.reply_to(message, "⚠️ Invalid format.\n📌 Use: /level <uid>", parse_mode=None)
+        active_bot.reply_to(message, "⚠️ Invalid format.\n📌 Use: /level <uid>", parse_mode=None)
         return
-    threading.Thread(target=process_level_tracker, args=(message, args[1]), daemon=True).start()
+    threading.Thread(target=process_level_tracker, args=(message, args[1], active_bot), daemon=True).start()
 
 
-def process_level_tracker(message, uid):
-    status_msg = bot.reply_to(
+def process_level_tracker(message, uid, active_bot=None):
+    active_bot = active_bot or active_bot_for(message)
+    status_msg = active_bot.reply_to(
         message,
         "⏳ Loading level tracker...",
         parse_mode=None,
     )
     data = call_api("meanffinfo", {"uid": uid}, timeout=180)
     if "error" in data:
-        bot.edit_message_text(
+        active_bot.edit_message_text(
             chat_id=status_msg.chat.id,
             message_id=status_msg.message_id,
             text=f"❌ LEVEL TRACKER FAILED\n━━━━━━━━━━━━━━━━━━\n{data['error']}",
@@ -2724,7 +2847,7 @@ def process_level_tracker(message, uid):
         return
     requested_by = requester_name(message.from_user)
     text = format_level_tracker(data, requested_by)
-    bot.edit_message_text(chat_id=status_msg.chat.id, message_id=status_msg.message_id, text=text[:3900], parse_mode="HTML")
+    active_bot.edit_message_text(chat_id=status_msg.chat.id, message_id=status_msg.message_id, text=text[:3900], parse_mode="HTML")
 
 
 def process_jwtcheck(message, uid, password):
@@ -2864,11 +2987,12 @@ def guestgen_command(message):
     threading.Thread(target=process_guestgen, args=(message, args[1].upper(), args[2], total, file_mode), daemon=True).start()
 
 
-def process_bio_update(message, params, bio):
-    status_msg = bot.send_message(message.chat.id, "⏳ Updating bio...\n━━━━━━━━━━━━━━━━━━\nPlease wait.", parse_mode=None)
+def process_bio_update(message, params, bio, active_bot=None):
+    active_bot = active_bot or active_bot_for(message)
+    status_msg = active_bot.send_message(message.chat.id, "⏳ Updating bio...\n━━━━━━━━━━━━━━━━━━\nPlease wait.", parse_mode=None)
     data = call_api("bio", params)
     text = format_bio_update(data, bio)
-    bot.edit_message_text(
+    active_bot.edit_message_text(
         chat_id=status_msg.chat.id,
         message_id=status_msg.message_id,
         text=text[:3900],
@@ -2878,8 +3002,11 @@ def process_bio_update(message, params, bio):
 
 @bot.message_handler(commands=["bio"])
 def bio_command(message):
-    safe_delete(message.chat.id, message.message_id)
-    if not check_access(message):
+    active_bot = active_bot_for(message)
+    if command_belongs_to_other_bot(message, active_bot):
+        return
+    safe_delete(message.chat.id, message.message_id, active_bot=active_bot)
+    if not check_access(message, active_bot=active_bot):
         return
     usage = "\n".join([
         "📝 BIO UPDATE",
@@ -2891,47 +3018,51 @@ def bio_command(message):
     ])
     parts = message.text.split(maxsplit=2)
     if len(parts) < 3:
-        bot.reply_to(message, usage, parse_mode=None)
+        active_bot.reply_to(message, usage, parse_mode=None)
         return
 
     token = parts[1].strip()
     bio = parts[2].strip()
     if not token or not bio:
-        bot.reply_to(message, usage, parse_mode=None)
+        active_bot.reply_to(message, usage, parse_mode=None)
         return
     if token.isdigit() and "|" in bio:
         password, bio_text = bio.split("|", 1)
         password = password.strip()
         bio_text = bio_text.strip()
         if not password or not bio_text:
-            bot.reply_to(message, usage, parse_mode=None)
+            active_bot.reply_to(message, usage, parse_mode=None)
             return
         params = {"uid": token, "password": password, "bio": bio_text}
         bio = bio_text
     else:
         params = {"token": token, "bio": bio}
 
-    threading.Thread(target=process_bio_update, args=(message, params, bio), daemon=True).start()
+    threading.Thread(target=process_bio_update, args=(message, params, bio, active_bot), daemon=True).start()
 
 
 @bot.message_handler(commands=["region"])
 def region_command(message):
+    active_bot = active_bot_for(message)
+    if command_belongs_to_other_bot(message, active_bot):
+        return
     args = message.text.split()
     if len(args) != 2 or not args[1].isdigit():
-        bot.reply_to(message, "⚠️ Invalid format.\n📌 Use: /region <uid>", parse_mode=None)
+        active_bot.reply_to(message, "⚠️ Invalid format.\n📌 Use: /region <uid>", parse_mode=None)
         return
-    threading.Thread(target=process_region_check, args=(message, args[1]), daemon=True).start()
+    threading.Thread(target=process_region_check, args=(message, args[1], active_bot), daemon=True).start()
 
 
-def process_region_check(message, uid):
-    status_msg = bot.reply_to(
+def process_region_check(message, uid, active_bot=None):
+    active_bot = active_bot or active_bot_for(message)
+    status_msg = active_bot.reply_to(
         message,
         "⏳ Checking region...",
         parse_mode=None,
     )
     data = call_api("check-region", {"uid": uid}, timeout=180)
     if "error" in data:
-        bot.edit_message_text(
+        active_bot.edit_message_text(
             chat_id=status_msg.chat.id,
             message_id=status_msg.message_id,
             text=f"❌ REGION CHECK FAILED\n━━━━━━━━━━━━━━━━━━\n{data['error']}",
@@ -2939,7 +3070,7 @@ def process_region_check(message, uid):
         )
         return
     requested_by = requester_name(message.from_user)
-    bot.edit_message_text(
+    active_bot.edit_message_text(
         chat_id=status_msg.chat.id,
         message_id=status_msg.message_id,
         text=format_region_info(data, requested_by),
@@ -4095,6 +4226,49 @@ def process_auto_token_refresh():
         time.sleep(TOKEN_AUTO_REFRESH_INTERVAL)
 
 
+def bind_handler_to_bot(handler, active_bot):
+    def wrapped(update):
+        setattr(update, "_active_bot", active_bot)
+        return handler(update)
+
+    return wrapped
+
+
+def register_user_bot_handlers():
+    if not user_bot:
+        return
+    for commands, handler in [
+        (["start"], start_command),
+        (["help"], help_command),
+        (["like"], like_command),
+        (["likeff"], likeff_command),
+        (["ffinfo"], ffinfo_command),
+        (["level"], level_command),
+        (["region"], region_command),
+        (["myautolike"], myautolike_command),
+        (["bio"], bio_command),
+    ]:
+        user_bot.message_handler(commands=commands)(bind_handler_to_bot(handler, user_bot))
+    user_bot.callback_query_handler(func=lambda call: call.data == "verify_join")(bind_handler_to_bot(verify_join_callback, user_bot))
+    user_bot.callback_query_handler(func=lambda call: call.data == "help_main")(bind_handler_to_bot(help_callback, user_bot))
+    user_bot.callback_query_handler(func=lambda call: str(call.data or "").startswith("help_page:"))(bind_handler_to_bot(help_page_callback, user_bot))
+
+
+def poll_telegram_bot(active_bot, label):
+    while True:
+        try:
+            active_bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30, none_stop=True)
+        except KeyboardInterrupt:
+            logger.info("%s stopped by user", label)
+            break
+        except Exception:
+            logger.exception("%s polling crashed; restarting in 5 seconds", label)
+            time.sleep(5)
+
+
+register_user_bot_handlers()
+
+
 if __name__ == "__main__":
     if not acquire_bot_instance_lock():
         raise SystemExit(1)
@@ -4102,13 +4276,7 @@ if __name__ == "__main__":
     threading.Thread(target=process_autolikeff_orders, daemon=True).start()
     threading.Thread(target=process_autolikeff_near_end_notices, daemon=True).start()
     threading.Thread(target=process_auto_token_refresh, daemon=True).start()
-    logger.info("Bot started. API_BASE_URL=%s FILE=%s", API_BASE_URL, os.path.abspath(__file__))
-    while True:
-        try:
-            bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30, none_stop=True)
-        except KeyboardInterrupt:
-            logger.info("Bot stopped by user")
-            break
-        except Exception:
-            logger.exception("Polling crashed; restarting in 5 seconds")
-            time.sleep(5)
+    if user_bot:
+        threading.Thread(target=poll_telegram_bot, args=(user_bot, "User bot"), daemon=True).start()
+    logger.info("Bot started. User bot=%s API_BASE_URL=%s FILE=%s", "enabled" if user_bot else "disabled", API_BASE_URL, os.path.abspath(__file__))
+    poll_telegram_bot(bot, "Main bot")
