@@ -1300,6 +1300,7 @@ def index():
             "checkbanned": "/checkbanned?id=xxx",
             "bio": "/bio?token=xxx&bio=hello",
             "createaccount": "/createaccount?region=ME&name=MEAN",
+            "atvguest": "/atvguest?uid=xxx&pw=xxx or /atvguest?token=xxx",
             "refresh": "/refresh"
         }
     }), 200
@@ -1320,6 +1321,7 @@ def not_found(_):
             "/checkbanned",
             "/bio",
             "/createaccount",
+            "/atvguest",
             "/refresh"
         ]
     }), 404
@@ -1433,6 +1435,81 @@ def jwt_login():
             "status": "error",
             "message": str(e)
         }), 500
+
+@FAHHHH.route('/atvguest', methods=['GET'])
+def activate_guest_api():
+    payload = request.get_json(silent=True) or {}
+    uid = payload.get('uid') or request.args.get('uid')
+    pw = payload.get('pw') or payload.get('password') or request.args.get('pw') or request.args.get('password')
+    raw_token = (
+        payload.get('token')
+        or payload.get('access_token')
+        or request.args.get('token')
+        or request.args.get('access_token')
+    )
+
+    if not ((uid and pw) or raw_token):
+        return jsonify({
+            "success": False,
+            "status": "error",
+            "message": "Missing parameters. Use /atvguest?uid=xxx&pw=xxx or /atvguest?token=xxx"
+        }), 400
+
+    try:
+        access_token = extract_bio_access_token(raw_token) if raw_token else None
+        if access_token:
+            open_id, inspect_data = get_bio_openid_from_inspect(access_token)
+            if not open_id:
+                return jsonify({
+                    "success": False,
+                    "status": "error",
+                    "activated": False,
+                    "message": "Invalid access token or could not fetch open_id",
+                    "details": inspect_data,
+                }), 401
+            jwt_token, platform_type = bio_major_login(access_token, open_id)
+            if not jwt_token:
+                return jsonify({
+                    "success": False,
+                    "status": "error",
+                    "activated": False,
+                    "message": "MajorLogin failed for access token"
+                }), 502
+            account_info = decode_bio_jwt(jwt_token) or {}
+            uid = account_info.get("uid") or uid
+            result = {
+                "uid": str(uid) if uid else None,
+                "account_id": account_info.get("account_id"),
+                "name": account_info.get("name") or account_info.get("nickname"),
+                "region": account_info.get("region"),
+                "token": jwt_token,
+                "platform_type": platform_type,
+            }
+        else:
+            result = fetch_guest_jwt_for_like_with_retry(uid, pw, max_retries=3, retry_delay=0.7)
+
+        region = normalize_region(result.get("region"))
+        if region and result.get("uid"):
+            set_cached_region(result.get("uid"), region)
+        return jsonify({
+            "success": True,
+            "status": "success",
+            "activated": True,
+            "uid": result.get("uid"),
+            "account_id": result.get("account_id"),
+            "name": result.get("name"),
+            "region": region or result.get("region"),
+            "access_token": access_token,
+            "jwt_token": result.get("token"),
+        }), 200
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "status": "error",
+            "activated": False,
+            "uid": uid,
+            "message": str(e)
+        }), 502
 
 @FAHHHH.route('/access-token', methods=['GET', 'POST'])
 def access_token_api():

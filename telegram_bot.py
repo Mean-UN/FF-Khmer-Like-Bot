@@ -1465,6 +1465,7 @@ def build_help_text(chat_id=None, user_id=None):
     if is_owner(user_id):
         lines.extend([
             "🎟 /jwt <uid> <password> - Generate/check JWT token",
+            "✅ /atvguest <uid> <password> or <token> - Activate guest account",
             "🧾 /guestgen <region> <name> [total] - Create guest account(s)",
             "💎 /autolikeff <uid> <total_likes> <telegram_user_id> - Create AutoLikeFF order",
             "📋 /autolikeff ls - List AutoLikeFF orders",
@@ -2350,6 +2351,40 @@ def format_jwt_check(data):
     ])
 
 
+def format_atvguest(data):
+    def v(value):
+        return escape(str(value if value not in (None, "") else "N/A"))
+
+    if not data.get("success"):
+        return "\n".join([
+            "❌ <b>GUEST ACTIVATION FAILED</b>",
+            "━━━━━━━━━━━━━━━━━━",
+            f"📌 <b>Error:</b> {v(data.get('message') or data.get('error'))}",
+        ])
+
+    lines = [
+        "✅ <b>GUEST ACTIVATION SUCCESS</b>",
+        "━━━━━━━━━━━━━━━━━━",
+        f"🆔 <b>Account ID:</b> <code>{v(data.get('account_id'))}</code>",
+        f"👤 <b>Name:</b> {v(data.get('name'))}",
+        f"🌐 <b>Region:</b> {v(data.get('region'))}",
+        f"🎮 <b>UID:</b> <code>{v(data.get('uid'))}</code>",
+    ]
+    if data.get("access_token"):
+        lines.extend([
+            "",
+            "🔑 <b>Access Token</b>",
+            f"<code>{v(data.get('access_token'))}</code>",
+        ])
+    if data.get("jwt_token"):
+        lines.extend([
+            "",
+            "🎟 <b>JWT Token</b>",
+            f"<code>{v(data.get('jwt_token'))}</code>",
+        ])
+    return "\n".join(lines)
+
+
 def format_guestgen(data):
     def v(value):
         return escape(str(value if value not in (None, "") else "N/A"))
@@ -2757,6 +2792,34 @@ def jwt_command(message):
     threading.Thread(target=process_jwtcheck, args=(message, args[1], args[2]), daemon=True).start()
 
 
+@bot.message_handler(commands=["atvguest"])
+def atvguest_command(message):
+    if not is_owner(message.from_user.id):
+        return
+    safe_delete(message.chat.id, message.message_id)
+    parts = message.text.split(maxsplit=2)
+    usage = "⚠️ Invalid format.\n📌 Use: /atvguest <uid> <password>\n🔑 Token: /atvguest <access_token_or_link>"
+    if len(parts) == 2:
+        params = {"token": parts[1].strip()}
+    elif len(parts) == 3 and parts[1].isdigit():
+        params = {"uid": parts[1], "pw": parts[2]}
+    else:
+        bot.send_message(message.chat.id, usage, parse_mode=None)
+        return
+    threading.Thread(target=process_atvguest, args=(message.chat.id, params), daemon=True).start()
+
+
+def process_atvguest(chat_id, params):
+    status_msg = bot.send_message(chat_id, "⏳ Activating guest...\n━━━━━━━━━━━━━━━━━━\nPlease wait.", parse_mode=None)
+    data = call_api("atvguest", params, timeout=90)
+    text = format_atvguest(data)
+    bot.edit_message_text(chat_id=status_msg.chat.id, message_id=status_msg.message_id, text=text[:3900], parse_mode="HTML")
+    extra = text[3900:]
+    while extra:
+        bot.send_message(status_msg.chat.id, extra[:3900], parse_mode="HTML")
+        extra = extra[3900:]
+
+
 def guest_account_record(data):
     return {
         "account_id": data.get("account_id"),
@@ -2766,6 +2829,24 @@ def guest_account_record(data):
         "password": data.get("password"),
         "access_token": data.get("access_token"),
     }
+
+
+def auto_activate_guest(data):
+    if data.get("account_id") not in (None, "", "null"):
+        return data
+    uid = data.get("uid")
+    password = data.get("password")
+    if not uid or not password:
+        return data
+    activation = call_api("atvguest", {"uid": uid, "pw": password}, timeout=60)
+    if not activation.get("success"):
+        data["activation_error"] = activation.get("message") or activation.get("error") or "Guest activation failed"
+        return data
+    data["account_id"] = activation.get("account_id") or data.get("account_id")
+    data["name"] = data.get("name") or activation.get("name")
+    data["region"] = activation.get("region") or data.get("region")
+    data["jwt_token"] = activation.get("jwt_token") or data.get("jwt_token")
+    return data
 
 
 def process_guestgen(message, region, name, total=None, file_mode=False):
@@ -2787,8 +2868,9 @@ def process_guestgen(message, region, name, total=None, file_mode=False):
             )
         data = call_api("createaccount", {"region": region, "name": name})
         if data.get("success") and not data.get("error"):
+            data = auto_activate_guest(data)
             if data.get("account_id") in (None, "", "null"):
-                failures.append("Generated account skipped because account_id is missing")
+                failures.append(data.get("activation_error") or "Generated account skipped because account_id is missing")
                 continue
             accounts.append(guest_account_record(data))
         else:
