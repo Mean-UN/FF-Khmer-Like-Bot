@@ -18,12 +18,16 @@ dist/
 # Generated account/token data
 tokens.json
 tokens_likeff.json
+tokens_likeff_*.json
 uidpass.json
 uidpass_likeff.json
+uidpass_likeff_*.json
 autolikeff_orders.json
 autolikeff_groups.json
 telegram_users.json
 regions.json
+likeff_slot_usage.json
+likeff_slot_accounts.json
 Guest-*.json
 
 # Logs and temporary files

@@ -58,16 +58,24 @@ UIDPASS_FILE_SETS = {
 TOKEN_AUTO_REFRESH_INTERVAL = 7 * 60 * 60
 AUTOLIKEFF_CHECK_INTERVAL = 60
 AUTOLIKEFF_DEFAULT_BATCH = 220
+AUTOLIKE_RUN_HOUR = 18
+AUTOLIKE_RUN_MINUTE = 0
 AUTOLIKEFF_RUN_HOUR = 9
 AUTOLIKEFF_RUN_MINUTE = 0
 AUTOLIKEFF_NOTICE_HOUR = 19
 AUTOLIKEFF_NOTICE_MINUTE = 0
 AUTOLIKEFF_NEAR_END_THRESHOLD = AUTOLIKEFF_DEFAULT_BATCH * 3
 AUTOLIKEFF_ORDER_DELAY = 30
+AUTOLIKE_ORDERS_FILE = os.path.join(BASE_DIR, "autolike_orders.json")
 AUTOLIKEFF_ORDERS_FILE = os.path.join(BASE_DIR, "autolikeff_orders.json")
 AUTOLIKEFF_GROUPS_FILE = os.path.join(BASE_DIR, "autolikeff_groups.json")
 TELEGRAM_USERS_FILE = os.path.join(BASE_DIR, "telegram_users.json")
 REGIONS_FILE = os.path.join(BASE_DIR, "regions.json")
+LIKEFF_SLOT_META_FILE = os.path.join(BASE_DIR, "likeff_slot_accounts.json")
+LIKEFF_SLOT_STATE_FILE = os.path.join(BASE_DIR, "likeff_slot_usage.json")
+LIKEFF_SLOT_COUNT = 30
+LIKEFF_LOW_LEVEL_MAX = 20
+LIKEFF_HIGH_LEVEL_MAX = 200
 GUESTGEN_SUPPORTED_REGIONS = [
     "IND", "SG", "RU", "ID", "TW", "US", "NA", "VN", "TH", "ME", "PK", "CIS", "SAC", "BR", "BD", "EU", "EUROPE",
 ]
@@ -555,8 +563,36 @@ def token_path(set_name):
     return os.path.join(BASE_DIR, UIDPASS_FILE_SETS[set_name][1])
 
 
-def load_uidpass(set_name):
-    path = uidpass_path(set_name)
+def uidpass_file_name(set_name, slot=None):
+    filename = UIDPASS_FILE_SETS[set_name][0]
+    if set_name == "likeff" and slot:
+        root, ext = os.path.splitext(filename)
+        filename = f"{root}_{slot}{ext}"
+    return filename
+
+
+def token_file_name(set_name, slot=None):
+    filename = UIDPASS_FILE_SETS[set_name][1]
+    if set_name == "likeff" and slot:
+        root, ext = os.path.splitext(filename)
+        filename = f"{root}_{slot}{ext}"
+    return filename
+
+
+def uidpass_path_for(set_name, slot=None):
+    if set_name not in UIDPASS_FILE_SETS:
+        return None
+    return os.path.join(BASE_DIR, uidpass_file_name(set_name, slot))
+
+
+def token_path_for(set_name, slot=None):
+    if set_name not in UIDPASS_FILE_SETS:
+        return None
+    return os.path.join(BASE_DIR, token_file_name(set_name, slot))
+
+
+def load_uidpass(set_name, slot=None):
+    path = uidpass_path_for(set_name, slot)
     if not path:
         raise ValueError("Unknown set. Use like or likeff.")
     if not os.path.exists(path):
@@ -568,8 +604,8 @@ def load_uidpass(set_name):
     return data
 
 
-def save_uidpass(set_name, accounts):
-    path = uidpass_path(set_name)
+def save_uidpass(set_name, accounts, slot=None):
+    path = uidpass_path_for(set_name, slot)
     tmp_path = f"{path}.tmp"
     with open(tmp_path, "w", encoding="utf-8") as uidpass_file:
         json.dump(accounts, uidpass_file, ensure_ascii=False, indent=4)
@@ -584,27 +620,75 @@ def find_uidpass_index(accounts, uid):
     return -1
 
 
-def run_token_update(set_name):
+def run_token_update(set_name, slot=None):
     command = [sys.executable, os.path.join(BASE_DIR, "update_like_tokens.py"), set_name]
+    if slot:
+        command.extend(["--slot", str(slot)])
     result = subprocess.run(command, cwd=BASE_DIR, capture_output=True, text=True, timeout=900)
     output = (result.stdout or "") + (result.stderr or "")
     return result.returncode, output.strip()
 
 
-def run_single_token_update(set_name, uid, password):
+def run_single_token_update(set_name, uid, password, slot=None):
     command = [sys.executable, os.path.join(BASE_DIR, "update_like_tokens.py"), set_name, str(uid), str(password)]
+    if slot:
+        command.extend(["--slot", str(slot)])
     result = subprocess.run(command, cwd=BASE_DIR, capture_output=True, text=True, timeout=180)
     output = (result.stdout or "") + (result.stderr or "")
     return result.returncode, output.strip()
 
 
-def load_token_list(set_name):
-    path = token_path(set_name)
+def token_refresh_targets():
+    targets = [("like", None)]
+    for slot in range(1, LIKEFF_SLOT_COUNT + 1):
+        if os.path.exists(uidpass_path_for("likeff", slot)):
+            targets.append(("likeff", slot))
+    return targets
+
+
+def load_token_list(set_name, slot=None):
+    path = token_path_for(set_name, slot)
     if not path or not os.path.exists(path):
         return []
     with open(path, "r", encoding="utf-8") as token_file:
         data = json.load(token_file)
     return data if isinstance(data, list) else []
+
+
+def save_token_list(set_name, tokens, slot=None):
+    path = token_path_for(set_name, slot)
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as token_file:
+        json.dump(tokens, token_file, ensure_ascii=False, indent=4)
+    os.replace(tmp_path, path)
+
+
+def upsert_token_item(set_name, token_item, slot=None):
+    tokens = load_token_list(set_name, slot)
+    uid = str(token_item.get("uid") or "")
+    updated = []
+    replaced = False
+    for item in tokens:
+        if isinstance(item, dict) and str(item.get("uid")) == uid:
+            if not replaced:
+                updated.append(token_item)
+                replaced = True
+            continue
+        updated.append(item)
+    if not replaced:
+        updated.append(token_item)
+    save_token_list(set_name, updated, slot)
+
+
+def delete_token_item(set_name, uid, slot=None):
+    uid = str(uid)
+    tokens = load_token_list(set_name, slot)
+    updated = [
+        item for item in tokens
+        if not (isinstance(item, dict) and str(item.get("uid")) == uid)
+    ]
+    save_token_list(set_name, updated, slot)
+    return len(tokens) - len(updated)
 
 
 def region_counts(tokens):
@@ -615,6 +699,249 @@ def region_counts(tokens):
         region = str(item.get("region") or item.get("Region") or "UNKNOWN").upper()
         counts[region] = counts.get(region, 0) + 1
     return counts
+
+
+def format_likeff_all_slots_summary():
+    total_accounts = 0
+    total_tokens = 0
+    total_low = 0
+    total_high = 0
+    all_region_counts = {}
+    slot_lines = []
+    meta = load_likeff_slot_meta()
+
+    for slot in range(1, LIKEFF_SLOT_COUNT + 1):
+        accounts = load_uidpass("likeff", slot)
+        tokens = load_token_list("likeff", slot)
+        if not accounts and not tokens:
+            continue
+
+        total_accounts += len(accounts)
+        total_tokens += len(tokens)
+        for region, count in region_counts(tokens).items():
+            all_region_counts[region] = all_region_counts.get(region, 0) + count
+
+        bucket_counts = likeff_slot_bucket_counts(meta, slot)
+        low_count = bucket_counts.get("level_8_20", 0)
+        high_count = bucket_counts.get("level_21_up", 0)
+        total_low += low_count
+        total_high += high_count
+        slot_lines.append(
+            f"› Slot {slot}: {len(accounts)} accounts | {len(tokens)} tokens | "
+            f"8-20: {low_count}/{LIKEFF_LOW_LEVEL_MAX} | "
+            f"21+: {high_count}/{LIKEFF_HIGH_LEVEL_MAX}"
+        )
+
+    lines = [
+        "📊 UIDPASS SUMMARY",
+        "━━━━━━━━━━━━━━━━━━",
+        "📦 Set: likeff slots",
+        f"👥 UIDPASS Accounts: {total_accounts}",
+        f"🎟 Tokens: {total_tokens}",
+        "",
+        "📦 Slots:",
+    ]
+    lines.extend(slot_lines or ["ℹ️ No slot files found."])
+    lines.extend(["", "🌍 Regions:"])
+    if all_region_counts:
+        for region, count in sorted(all_region_counts.items()):
+            lines.append(f"› {region}: {count}")
+    else:
+        lines.append("ℹ️ No tokens found.")
+    lines.extend([
+        "",
+        "⭐ LikeFF Level Buckets:",
+        f"› Level 8-20: {total_low}/{LIKEFF_LOW_LEVEL_MAX * LIKEFF_SLOT_COUNT}",
+        f"› Level 21+: {total_high}/{LIKEFF_HIGH_LEVEL_MAX * LIKEFF_SLOT_COUNT}",
+    ])
+    return "\n".join(lines)
+
+
+def load_likeff_slot_meta():
+    data = read_json_file(LIKEFF_SLOT_META_FILE, {"slots": {}})
+    if not isinstance(data, dict):
+        data = {"slots": {}}
+    if not isinstance(data.get("slots"), dict):
+        data["slots"] = {}
+    return data
+
+
+def save_likeff_slot_meta(data):
+    write_json_file(LIKEFF_SLOT_META_FILE, data)
+
+
+def likeff_level_bucket(level):
+    try:
+        level = int(level)
+    except (TypeError, ValueError):
+        return None
+    if 8 <= level <= 20:
+        return "level_8_20"
+    if level >= 21:
+        return "level_21_up"
+    return None
+
+
+def likeff_slot_bucket_counts(meta, slot):
+    slot_accounts = meta.get("slots", {}).get(str(slot), {})
+    if not isinstance(slot_accounts, dict):
+        return {"level_8_20": 0, "level_21_up": 0}
+    counts = {"level_8_20": 0, "level_21_up": 0}
+    for item in slot_accounts.values():
+        bucket = likeff_level_bucket(item.get("level")) if isinstance(item, dict) else None
+        if bucket:
+            counts[bucket] += 1
+    return counts
+
+
+def likeff_slot_has_space(meta, slot, bucket):
+    counts = likeff_slot_bucket_counts(meta, slot)
+    limit = LIKEFF_LOW_LEVEL_MAX if bucket == "level_8_20" else LIKEFF_HIGH_LEVEL_MAX
+    return counts.get(bucket, 0) < limit
+
+
+def find_likeff_slot_for_level(start_slot, level):
+    bucket = likeff_level_bucket(level)
+    if not bucket:
+        return None, None, "Only level 8+ accounts can be added to LikeFF slots."
+    meta = load_likeff_slot_meta()
+    start_slot = int(start_slot or 1)
+    for slot in range(start_slot, LIKEFF_SLOT_COUNT + 1):
+        if likeff_slot_has_space(meta, slot, bucket):
+            return slot, bucket, None
+    for slot in range(1, start_slot):
+        if likeff_slot_has_space(meta, slot, bucket):
+            return slot, bucket, None
+    limit = LIKEFF_LOW_LEVEL_MAX if bucket == "level_8_20" else LIKEFF_HIGH_LEVEL_MAX
+    return None, bucket, f"No LikeFF slot has space for this level bucket. Limit is {limit} per slot."
+
+
+def save_likeff_slot_account(slot, uid, password, profile):
+    meta = load_likeff_slot_meta()
+    slots = meta.setdefault("slots", {})
+    slot_accounts = slots.setdefault(str(slot), {})
+    slot_accounts[str(uid)] = {
+        "uid": str(uid),
+        "account_id": str(profile.get("account_id") or ""),
+        "password": password,
+        "name": profile.get("name"),
+        "region": profile.get("region"),
+        "level": profile.get("level"),
+        "bucket": likeff_level_bucket(profile.get("level")),
+        "updated_at": datetime.now(CAMBODIA_TZ).isoformat(),
+    }
+    save_likeff_slot_meta(meta)
+
+
+def remove_likeff_slot_account(slot, uid):
+    meta = load_likeff_slot_meta()
+    slot_accounts = meta.get("slots", {}).get(str(slot), {})
+    if isinstance(slot_accounts, dict):
+        slot_accounts.pop(str(uid), None)
+        save_likeff_slot_meta(meta)
+
+
+def fetch_likeff_account_profile(uid):
+    data = call_api("meanffinfo", {"uid": uid}, timeout=180)
+    if "error" in data:
+        raise ValueError(data.get("error") or "Could not check account profile")
+    basic = data.get("basicInfo") or data.get("basic_info") or data.get("AccountInfo") or {}
+    level = basic.get("level") or data.get("level")
+    region = basic.get("region") or data.get("region") or data.get("Region")
+    name = basic.get("nickname") or basic.get("name") or data.get("nickname") or data.get("name")
+    if level in (None, "", "N/A"):
+        raise ValueError("Could not check account level")
+    return {"level": int(level), "region": region or "N/A", "name": name or "N/A"}
+
+
+def generate_likeff_token_item(uid, password):
+    import lssj
+    return lssj.fetch_guest_jwt_for_like_with_retry(uid, password)
+
+
+def fetch_likeff_account_profile_from_token(uid, token_item):
+    account_id = token_item.get("account_id")
+    if not account_id:
+        raise ValueError("Token generation did not return account_id")
+    profile = fetch_likeff_account_profile(account_id)
+    profile["account_id"] = str(account_id)
+    profile["guest_uid"] = str(uid)
+    if token_item.get("name") and profile.get("name") in (None, "", "N/A"):
+        profile["name"] = token_item.get("name")
+    if token_item.get("region") and profile.get("region") in (None, "", "N/A"):
+        profile["region"] = token_item.get("region")
+    return profile
+
+
+def find_likeff_uid_existing_slot(uid):
+    uid = str(uid)
+    for slot in range(1, LIKEFF_SLOT_COUNT + 1):
+        accounts = load_uidpass("likeff", slot)
+        if find_uidpass_index(accounts, uid) != -1:
+            return slot
+    return None
+
+
+def extract_uidpass_items(data):
+    if isinstance(data, dict):
+        if isinstance(data.get("items"), list):
+            data = data["items"]
+        elif isinstance(data.get("accounts"), list):
+            data = data["accounts"]
+        else:
+            data = [data]
+    if not isinstance(data, list):
+        raise ValueError("JSON must be a list or contain items/accounts list")
+    items = []
+    seen = set()
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        uid = str(entry.get("uid") or "").strip()
+        password = str(entry.get("password") or "").strip()
+        if not uid or not password or not uid.isdigit() or uid in seen:
+            continue
+        seen.add(uid)
+        items.append({"uid": uid, "password": password})
+    return items
+
+
+def uidpass_json_from_message(message):
+    reply = message.reply_to_message
+    if not reply:
+        raise ValueError("Reply to JSON text or a .json file.")
+    if getattr(reply, "document", None):
+        file_info = bot.get_file(reply.document.file_id)
+        raw = bot.download_file(file_info.file_path)
+        return raw.decode("utf-8", errors="replace")
+    text = reply.text or reply.caption
+    if not text:
+        raise ValueError("Reply message does not contain JSON text.")
+    return text
+
+
+def add_likeff_account_to_slot(start_slot, uid, password):
+    existing_slot = find_likeff_uid_existing_slot(uid)
+    if existing_slot:
+        return {"uid": uid, "status": "duplicate", "slot": existing_slot}
+    token_item = generate_likeff_token_item(uid, password)
+    profile = fetch_likeff_account_profile_from_token(uid, token_item)
+    target_slot, bucket, slot_error = find_likeff_slot_for_level(start_slot, profile["level"])
+    if slot_error:
+        return {"uid": uid, "status": "failed", "error": slot_error}
+    accounts = load_uidpass("likeff", target_slot)
+    accounts.append({"uid": uid, "password": password})
+    save_uidpass("likeff", accounts, target_slot)
+    upsert_token_item("likeff", token_item, target_slot)
+    save_likeff_slot_account(target_slot, uid, password, profile)
+    return {
+        "uid": uid,
+        "status": "added",
+        "slot": target_slot,
+        "level": profile.get("level"),
+        "region": profile.get("region"),
+        "account_id": profile.get("account_id"),
+    }
 
 
 def read_json_file(path, default):
@@ -743,16 +1070,24 @@ def save_autolike_groups(groups):
     write_json_file(AUTOLIKEFF_GROUPS_FILE, sorted({str(group_id) for group_id in groups}, key=str))
 
 
-def load_autolike_orders():
-    return read_json_file(AUTOLIKEFF_ORDERS_FILE, [])
+def autolike_orders_file(kind="likeff"):
+    return AUTOLIKE_ORDERS_FILE if kind == "like" else AUTOLIKEFF_ORDERS_FILE
 
 
-def save_autolike_orders(orders):
-    write_json_file(AUTOLIKEFF_ORDERS_FILE, orders)
+def autolike_label(kind="likeff"):
+    return "AUTOLIKE" if kind == "like" else "AUTOLIKEFF"
 
 
-def merge_save_autolike_orders(updated_orders):
-    current_orders = load_autolike_orders()
+def load_autolike_orders(kind="likeff"):
+    return read_json_file(autolike_orders_file(kind), [])
+
+
+def save_autolike_orders(orders, kind="likeff"):
+    write_json_file(autolike_orders_file(kind), orders)
+
+
+def merge_save_autolike_orders(updated_orders, kind="likeff"):
+    current_orders = load_autolike_orders(kind)
     current_by_id = {str(order.get("order_id")): order for order in current_orders}
     for order in updated_orders:
         order_id = str(order.get("order_id"))
@@ -763,7 +1098,7 @@ def merge_save_autolike_orders(updated_orders):
                 current_by_id[order_id] = order
     merged = list(current_by_id.values())
     merged.sort(key=lambda order: int(order.get("order_id", 0) or 0))
-    save_autolike_orders(merged)
+    save_autolike_orders(merged, kind)
 
 
 def next_autolike_order_id(orders):
@@ -780,14 +1115,21 @@ def current_reset_period():
     return usage_reset_period(datetime.now(CAMBODIA_TZ)).isoformat()
 
 
-def autolike_run_datetime(value=None):
-    value = value or datetime.now(CAMBODIA_TZ)
-    return value.replace(hour=AUTOLIKEFF_RUN_HOUR, minute=AUTOLIKEFF_RUN_MINUTE, second=0, microsecond=0)
+def autolike_run_time(kind="likeff"):
+    if kind == "like":
+        return AUTOLIKE_RUN_HOUR, AUTOLIKE_RUN_MINUTE
+    return AUTOLIKEFF_RUN_HOUR, AUTOLIKEFF_RUN_MINUTE
 
 
-def next_autolike_run_date(value=None):
+def autolike_run_datetime(value=None, kind="likeff"):
     value = value or datetime.now(CAMBODIA_TZ)
-    run_time = autolike_run_datetime(value)
+    hour, minute = autolike_run_time(kind)
+    return value.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+
+def next_autolike_run_date(value=None, kind="likeff"):
+    value = value or datetime.now(CAMBODIA_TZ)
+    run_time = autolike_run_datetime(value, kind)
     if value >= run_time:
         run_time += timedelta(days=1)
     return run_time.date().isoformat()
@@ -829,9 +1171,11 @@ def autolike_order_status(order):
     return sent, total, remaining
 
 
-def format_autolike_order(order, title="✅ AUTOLIKEFF ORDER CREATED"):
+def format_autolike_order(order, title=None, kind="likeff"):
+    title = title or f"✅ {autolike_label(kind)} ORDER CREATED"
     sent, total, remaining = autolike_order_status(order)
     telegram_user = autolike_order_user_display(order, html=True)
+    run_hour, run_minute = autolike_run_time(kind)
     return "\n".join([
         title,
         "━━━━━━━━━━━━━━━━━━",
@@ -842,15 +1186,16 @@ def format_autolike_order(order, title="✅ AUTOLIKEFF ORDER CREATED"):
         f"✅ Delivered: {sent:,}",
         f"⏳ Remaining: {max(0, remaining):,}",
         f"📌 Status: {order.get('status', 'active')}",
-        f"🕘 Next Run: {order.get('next_run_date', 'N/A')} {AUTOLIKEFF_RUN_HOUR:02d}:{AUTOLIKEFF_RUN_MINUTE:02d} Cambodia",
+        f"🕘 Next Run: {order.get('next_run_date', 'N/A')} {run_hour:02d}:{run_minute:02d} Cambodia",
     ])
 
 
-def format_autolike_list(orders):
+def format_autolike_list(orders, kind="likeff"):
+    label = autolike_label(kind)
     if not orders:
-        return "ℹ️ AUTOLIKEFF ORDERS\n━━━━━━━━━━━━━━━━━━\nNo AutoLikeFF orders found."
+        return f"ℹ️ {label} ORDERS\n━━━━━━━━━━━━━━━━━━\nNo {label} orders found."
     lines = [
-        "📋 AUTOLIKEFF ORDER LIST",
+        f"📋 {label} ORDER LIST",
         "━━━━━━━━━━━━━━━━━━",
         f"📦 Total Orders: {len(orders)}",
     ]
@@ -870,7 +1215,9 @@ def format_autolike_list(orders):
     return "\n".join(lines)
 
 
-def format_autolike_summary(orders):
+def format_autolike_summary(orders, kind="likeff"):
+    label = autolike_label(kind)
+    run_hour, run_minute = autolike_run_time(kind)
     total_orders = len(orders)
     completed_orders = 0
     total_likes = 0
@@ -885,7 +1232,7 @@ def format_autolike_summary(orders):
         remaining_likes += max(0, remaining)
     progress = (delivered_likes / total_likes * 100) if total_likes > 0 else 0
     return "\n".join([
-        "📊 AUTOLIKEFF SUMMARY",
+        f"📊 {label} SUMMARY",
         "━━━━━━━━━━━━━━━━━━",
         f"📦 Total Orders: {total_orders}",
         f"🏁 Completed Orders: {completed_orders}",
@@ -895,7 +1242,7 @@ def format_autolike_summary(orders):
         f"⏳ Total Remaining: {remaining_likes:,}",
         f"📈 Progress: {progress:.2f}%",
         "",
-        f"🕘 Daily Run: {AUTOLIKEFF_RUN_HOUR:02d}:{AUTOLIKEFF_RUN_MINUTE:02d} Cambodia",
+        f"🕘 Daily Run: {run_hour:02d}:{run_minute:02d} Cambodia",
         f"⏱ Delay Between Orders: {AUTOLIKEFF_ORDER_DELAY}s",
     ])
 
@@ -924,13 +1271,13 @@ def format_my_autolike_orders(user, orders):
             f"👋 Hello {full_name}",
             "",
             "❌ You don't have any autolike tasks!",
-            f"🚀 Contact {owner_contact} to renew AutoLikeFF.",
+            f"🚀 Contact {owner_contact} to renew AutoLike.",
         ])
 
     lines = [
         f"👋 Hello {full_name}",
         "",
-        "📦 Your AutoLikeFF Details",
+        "📦 Your AutoLike Details",
         "━━━━━━━━━━━━━━━━━━",
     ]
     for index, order in enumerate(user_orders, 1):
@@ -939,6 +1286,7 @@ def format_my_autolike_orders(user, orders):
         lines.extend([
             "",
             f"#{index}",
+            f"📌 Type: {autolike_label(order.get('kind', 'likeff'))}",
             f"🆔 UID: {order.get('uid', 'N/A')}",
             f"👤 Player: {order.get('player_name') or 'N/A'}",
             f"👍 Likes Before Purchase: {fmt_num(order.get('likes_before_purchase'))}",
@@ -1104,7 +1452,19 @@ def find_existing_autolike_order(orders, uid):
     return None
 
 
-def deliver_autolikeff_order(order, period=None, schedule_next=True, notify_failure=True):
+def get_likeff_assigned_slot(uid):
+    data = read_json_file(LIKEFF_SLOT_STATE_FILE, {})
+    if data.get("date") != datetime.now(CAMBODIA_TZ).date().isoformat():
+        return None
+    slot = data.get("assignments", {}).get(str(uid))
+    if str(slot).isdigit():
+        slot = int(slot)
+        if 1 <= slot <= LIKEFF_SLOT_COUNT:
+            return slot
+    return None
+
+
+def deliver_autolike_order(order, kind="likeff", period=None, schedule_next=True, notify_failure=True):
     now = datetime.now(CAMBODIA_TZ)
     period = period or current_autolike_period(now)
     sent, total, remaining = autolike_order_status(order)
@@ -1121,12 +1481,15 @@ def deliver_autolikeff_order(order, period=None, schedule_next=True, notify_fail
             order["next_run_date"] = (now + timedelta(days=1)).date().isoformat()
         return False
 
-    data = call_api("likeff", {"uid": uid}, timeout=240)
+    endpoint = "like" if kind == "like" else "likeff"
+    data = call_api(endpoint, {"uid": uid}, timeout=240)
     error_text = str(data.get("error") or "")
-    if not data.get("success") and ("401" in error_text or "Unauthorized" in error_text):
-        logger.info("AutoLikeFF auth error for UID %s; refreshing likeff tokens and retrying once", uid)
-        run_token_update("likeff")
-        data = call_api("likeff", {"uid": uid}, timeout=240)
+    if kind == "likeff" and not data.get("success") and ("401" in error_text or "Unauthorized" in error_text):
+        slot = data.get("slot") or get_likeff_assigned_slot(uid)
+        logger.info("AutoLikeFF auth error for UID %s; refreshing likeff slot %s and retrying once", uid, slot or "unknown")
+        if slot:
+            run_token_update("likeff", slot)
+        data = call_api(endpoint, {"uid": uid}, timeout=240)
     order["last_attempt_period"] = period
     order["last_run_at"] = now.strftime("%d %b %Y %H:%M:%S")
 
@@ -1138,7 +1501,7 @@ def deliver_autolikeff_order(order, period=None, schedule_next=True, notify_fail
             notify_autolike_order(
                 order,
                 "\n".join([
-                    "❌ AUTOLIKEFF DELIVERY FAILED",
+                    f"❌ {autolike_label(kind)} DELIVERY FAILED",
                     "━━━━━━━━━━━━━━━━━━",
                     f"🧾 Order ID: {order.get('order_id', 'N/A')}",
                     f"🆔 UID: {uid}",
@@ -1179,9 +1542,13 @@ def deliver_autolikeff_order(order, period=None, schedule_next=True, notify_fail
     return True
 
 
-def deliver_autolikeff_order_now(order_id):
+def deliver_autolikeff_order(order, period=None, schedule_next=True, notify_failure=True):
+    return deliver_autolike_order(order, "likeff", period, schedule_next, notify_failure)
+
+
+def deliver_autolike_order_now(order_id, kind="likeff"):
     with autolike_lock:
-        orders = load_autolike_orders()
+        orders = load_autolike_orders(kind)
     target_order = None
     for order in orders:
         if str(order.get("order_id")) == str(order_id):
@@ -1189,9 +1556,13 @@ def deliver_autolikeff_order_now(order_id):
             break
     if not target_order:
         return
-    deliver_autolikeff_order(target_order, period=current_autolike_period(), schedule_next=True)
+    deliver_autolike_order(target_order, kind, period=current_autolike_period(), schedule_next=True)
     with autolike_lock:
-        merge_save_autolike_orders([target_order])
+        merge_save_autolike_orders([target_order], kind)
+
+
+def deliver_autolikeff_order_now(order_id):
+    deliver_autolike_order_now(order_id, "likeff")
 
 
 def check_access(message, active_bot=None):
@@ -1617,7 +1988,12 @@ def build_help_text(chat_id=None, user_id=None, active_bot=None, page="main"):
             "💎 AUTOLIKEFF OWNER",
             "━━━━━━━━━━━━━━━━━━",
             "🎟 /jwt <uid> <password> - Generate/check JWT token",
+            "✅ /atvguest <uid> <password> or <token> - Activate guest account",
             "🧾 /guestgen <region> <name> [total] - Create guest account(s)",
+            "❤️ /autolike <uid> <total_likes> <telegram_user_id> - Create AutoLike order",
+            "📋 /autolike ls - List AutoLike orders",
+            "📊 /autolike summary - View AutoLike totals",
+            "🗑 /autolike del <uid> - Remove AutoLike order",
             "💎 /autolikeff <uid> <total_likes> <telegram_user_id> - Create AutoLikeFF order",
             "📋 /autolikeff ls - List AutoLikeFF orders",
             "📊 /autolikeff summary - View AutoLikeFF totals",
@@ -1625,7 +2001,9 @@ def build_help_text(chat_id=None, user_id=None, active_bot=None, page="main"):
             "➕ /extend <uid> <extra_likes> - Extend AutoLikeFF order",
             "🏷 /autolikegroup <set|del|ls> [group_id] - Manage AutoLikeFF groups",
             "📦 /uidpass <ls|add|set|del|up> - Manage like accounts",
-            "📦 /uidpassff <ls|add|set|del|up> - Manage likeff accounts",
+            "📦 /uidpassff <slot> <ls|add|set|del|up> - Manage LikeFF slots",
+            "📦 /uidpassff 1 add <uid> <password> - Add account to slot",
+            "📥 /uidpassff 1 bulk - Reply to JSON to import accounts",
             "⏳ /remain - Check daily request usage",
             "",
             "👑 OWNER INFO",
@@ -2577,7 +2955,12 @@ def myautolike_command(message):
     if command_belongs_to_other_bot(message, active_bot):
         return
     with autolike_lock:
-        orders = load_autolike_orders()
+        orders = []
+        for kind, kind_orders in (("like", load_autolike_orders("like")), ("likeff", load_autolike_orders("likeff"))):
+            for order in kind_orders:
+                item = dict(order)
+                item.setdefault("kind", kind)
+                orders.append(item)
     text = format_my_autolike_orders(message.from_user, orders)
     send_long_message(message, text, parse_mode=None, active_bot=active_bot)
 
@@ -2624,29 +3007,40 @@ def autolikegroup_command(message):
 
 @bot.message_handler(commands=["autolikeff"])
 def autolikeff_command(message):
+    handle_autolike_owner_command(message, "likeff")
+
+
+@bot.message_handler(commands=["autolike"])
+def autolike_command(message):
+    handle_autolike_owner_command(message, "like")
+
+
+def handle_autolike_owner_command(message, kind="likeff"):
     if not is_owner(message.from_user.id):
         return
+    label = autolike_label(kind)
+    command = "autolike" if kind == "like" else "autolikeff"
     parts = message.text.split()
 
     if len(parts) == 2 and parts[1].lower() in {"ls", "list"}:
         with autolike_lock:
-            orders = load_autolike_orders()
-            text = format_autolike_list(orders)
-            save_autolike_orders(orders)
+            orders = load_autolike_orders(kind)
+            text = format_autolike_list(orders, kind)
+            save_autolike_orders(orders, kind)
         send_long_message(message, text, parse_mode=None)
         return
 
     if len(parts) == 2 and parts[1].lower() in {"summary", "data", "stats"}:
         with autolike_lock:
-            orders = load_autolike_orders()
-        bot.reply_to(message, format_autolike_summary(orders), parse_mode=None)
+            orders = load_autolike_orders(kind)
+        bot.reply_to(message, format_autolike_summary(orders, kind), parse_mode=None)
         return
 
     if len(parts) == 3 and parts[1].lower() in {"del", "delete", "remove"} and parts[2].isdigit():
         uid = parts[2]
         removed_order = None
         with autolike_lock:
-            orders = load_autolike_orders()
+            orders = load_autolike_orders(kind)
             kept_orders = []
             for order in orders:
                 if str(order.get("uid")) == uid and order.get("status") != "cancelled":
@@ -2656,14 +3050,14 @@ def autolikeff_command(message):
                     removed_order = order
                     continue
                 kept_orders.append(order)
-            save_autolike_orders(kept_orders)
+            save_autolike_orders(kept_orders, kind)
 
         if not removed_order:
-            reply_premium(message, "ℹ️ AutoLikeFF order not found for this UID.")
+            reply_premium(message, f"ℹ️ {label} order not found for this UID.")
             return
 
         text = "\n".join([
-            "✅ AUTOLIKEFF ORDER REMOVED",
+            f"✅ {label} ORDER REMOVED",
             "━━━━━━━━━━━━━━━━━━",
             f"🧾 Order ID: {removed_order.get('order_id', 'N/A')}",
             f"🆔 UID: {uid}",
@@ -2676,7 +3070,7 @@ def autolikeff_command(message):
         return
 
     if len(parts) != 4 or not parts[1].isdigit() or not parts[2].isdigit() or not parts[3].isdigit():
-        reply_premium(message, "⚠️ Invalid format.\n📌 Use: /autolikeff <uid> <total_likes> <telegram_user_id>\n📋 List: /autolikeff ls\n📊 Summary: /autolikeff summary\n🗑 Delete: /autolikeff del <uid>")
+        reply_premium(message, f"⚠️ Invalid format.\n📌 Use: /{command} <uid> <total_likes> <telegram_user_id>\n📋 List: /{command} ls\n📊 Summary: /{command} summary\n🗑 Delete: /{command} del <uid>")
         return
 
     uid = parts[1]
@@ -2690,13 +3084,13 @@ def autolikeff_command(message):
     group_id = resolve_autolike_group_id(message)
     telegram_user = telegram_user_record(telegram_user_id, chat_id=group_id)
     with autolike_lock:
-        orders = load_autolike_orders()
+        orders = load_autolike_orders(kind)
         existing_order = find_existing_autolike_order(orders, uid)
         if existing_order:
             bot.reply_to(
                 message,
                 "\n".join([
-                    "⚠️ AUTOLIKEFF ORDER EXISTS",
+                    f"⚠️ {label} ORDER EXISTS",
                     "━━━━━━━━━━━━━━━━━━",
                     f"🧾 Order ID: {existing_order.get('order_id', 'N/A')}",
                     f"🆔 UID: {uid}",
@@ -2707,6 +3101,7 @@ def autolikeff_command(message):
             return
         order = {
             "order_id": next_autolike_order_id(orders),
+            "kind": kind,
             "uid": uid,
             "total_likes": total_likes,
             "sent_likes": 0,
@@ -2718,14 +3113,14 @@ def autolikeff_command(message):
             "created_at": now_text,
             "status": "active",
             "last_period": "",
-            "next_run_date": next_autolike_run_date(),
+            "next_run_date": next_autolike_run_date(kind=kind),
             "last_error": "",
         }
         orders.append(order)
-        save_autolike_orders(orders)
+        save_autolike_orders(orders, kind)
 
     text = "\n".join([
-        "✅ AUTOLIKEFF ORDER CREATED",
+        f"✅ {label} ORDER CREATED",
         "━━━━━━━━━━━━━━━━━━",
         f"🧾 Order ID: {order.get('order_id', 'N/A')}",
         f"🆔 UID: {uid}",
@@ -2734,7 +3129,7 @@ def autolikeff_command(message):
         "⏳ First delivery is processing now.",
     ])
     bot.reply_to(message, text, parse_mode="HTML")
-    threading.Thread(target=deliver_autolikeff_order_now, args=(order["order_id"],), daemon=True).start()
+    threading.Thread(target=deliver_autolike_order_now, args=(order["order_id"], kind), daemon=True).start()
 
 
 @bot.message_handler(commands=["extend"])
@@ -2753,26 +3148,32 @@ def extend_autolikeff_command(message):
         return
 
     updated_order = None
+    updated_kind = "likeff"
     with autolike_lock:
-        orders = load_autolike_orders()
-        for order in orders:
-            if str(order.get("uid")) == uid and order.get("status") != "cancelled":
-                if not is_owner(message.from_user.id) and str(order.get("group_id")) != str(message.chat.id):
-                    continue
-                order["total_likes"] = int(order.get("total_likes", 0) or 0) + extra_likes
-                if order.get("status") == "completed":
-                    order["status"] = "active"
-                    order["next_run_date"] = next_autolike_run_date()
-                order["extended_at"] = datetime.now(CAMBODIA_TZ).strftime("%d %b %Y %H:%M:%S")
-                updated_order = order
+        for kind in ("like", "likeff"):
+            orders = load_autolike_orders(kind)
+            for order in orders:
+                if str(order.get("uid")) == uid and order.get("status") != "cancelled":
+                    if not is_owner(message.from_user.id) and str(order.get("group_id")) != str(message.chat.id):
+                        continue
+                    order["total_likes"] = int(order.get("total_likes", 0) or 0) + extra_likes
+                    if order.get("status") == "completed":
+                        order["status"] = "active"
+                        order["next_run_date"] = next_autolike_run_date(kind=kind)
+                    order["extended_at"] = datetime.now(CAMBODIA_TZ).strftime("%d %b %Y %H:%M:%S")
+                    order.setdefault("kind", kind)
+                    updated_order = order
+                    updated_kind = kind
+                    break
+            if updated_order:
+                save_autolike_orders(orders, kind)
                 break
-        save_autolike_orders(orders)
 
     if not updated_order:
-        bot.reply_to(message, "ℹ️ AutoLikeFF order not found for this UID.", parse_mode=None)
+        bot.reply_to(message, "ℹ️ AutoLike order not found for this UID.", parse_mode=None)
         return
 
-    text = format_autolike_order(updated_order, title="✅ AUTOLIKEFF ORDER EXTENDED")
+    text = format_autolike_order(updated_order, title=f"✅ {autolike_label(updated_kind)} ORDER EXTENDED", kind=updated_kind)
     bot.reply_to(message, text, parse_mode="HTML")
     try:
         bot.send_message(int(updated_order.get("telegram_user_id")), text, parse_mode="HTML")
@@ -3092,27 +3493,61 @@ def remain_command(message):
     bot.reply_to(message, "\n".join(lines), parse_mode=None)
 
 
-def process_uidpass_update(message, set_name):
-    status_msg = bot.send_message(message.chat.id, f"⏳ Updating {set_name} tokens...\n━━━━━━━━━━━━━━━━━━\nPlease wait.", parse_mode=None)
+def process_uidpass_update(message, set_name, slot=None):
+    if set_name == "likeff" and slot is None:
+        status_msg = bot.send_message(message.chat.id, "⏳ Updating all LikeFF slot tokens...\n━━━━━━━━━━━━━━━━━━\nPlease wait.", parse_mode=None)
+        updated = 0
+        failed = 0
+        details = []
+        for _, target_slot in token_refresh_targets():
+            if not target_slot:
+                continue
+            code, output = run_token_update("likeff", target_slot)
+            tokens = load_token_list("likeff", target_slot)
+            if code == 0:
+                updated += 1
+            else:
+                failed += 1
+                details.append(f"Slot {target_slot}: {output[-300:] if output else 'failed'}")
+            details.append(f"Slot {target_slot}: {len(tokens)} tokens")
+        text = "\n".join([
+            "✅ LIKEFF SLOT TOKEN UPDATE DONE" if failed == 0 else "⚠️ LIKEFF SLOT TOKEN UPDATE DONE",
+            "━━━━━━━━━━━━━━━━━━",
+            f"📦 Slots Updated: {updated}",
+            f"❌ Failed Slots: {failed}",
+            "",
+            *(details[-20:] if details else ["ℹ️ No slot uidpass files found."]),
+        ])
+        bot.edit_message_text(chat_id=status_msg.chat.id, message_id=status_msg.message_id, text=text[:3900], parse_mode=None)
+        return
+
+    slot_text = f" slot {slot}" if slot else ""
+    status_msg = bot.send_message(message.chat.id, f"⏳ Updating {set_name}{slot_text} tokens...\n━━━━━━━━━━━━━━━━━━\nPlease wait.", parse_mode=None)
     try:
-        code, output = run_token_update(set_name)
-        token_file = UIDPASS_FILE_SETS[set_name][1]
+        code, output = run_token_update(set_name, slot)
+        token_file = token_file_name(set_name, slot)
+        tokens = load_token_list(set_name, slot)
+        success_count = output.count("updated token for UID")
+        failed_count = output.count("failed UID")
         if code == 0:
             text = "\n".join([
                 "✅ UIDPASS TOKEN UPDATE DONE",
                 "━━━━━━━━━━━━━━━━━━",
-                f"📦 Set: {set_name}",
+                f"📦 Set: {'Slot ' + str(slot) if slot else set_name}",
                 f"📄 Token File: {token_file}",
-                "",
-                (output[-3000:] if output else "ℹ️ No output."),
+                f"🎟 Tokens: {len(tokens)}",
+                f"✅ Success: {success_count or len(tokens)}",
+                f"❌ Failed: {failed_count}",
             ])
         else:
             text = "\n".join([
                 "❌ UIDPASS TOKEN UPDATE FAILED",
                 "━━━━━━━━━━━━━━━━━━",
-                f"📦 Set: {set_name}",
-                "",
-                (output[-3000:] if output else f"Exit code {code}"),
+                f"📦 Set: {'Slot ' + str(slot) if slot else set_name}",
+                f"📄 Token File: {token_file}",
+                f"🎟 Tokens: {len(tokens)}",
+                f"✅ Success: {success_count}",
+                f"❌ Failed: {failed_count or 'Unknown'}",
             ])
         bot.edit_message_text(chat_id=status_msg.chat.id, message_id=status_msg.message_id, text=text, parse_mode=None)
     except Exception as exc:
@@ -3124,30 +3559,31 @@ def process_uidpass_update(message, set_name):
         )
 
 
-def process_single_uidpass_token_update(message, set_name, uid, password, action_title):
+def process_single_uidpass_token_update(message, set_name, uid, password, action_title, slot=None):
+    slot_text = f" Slot {slot}" if slot else ""
     status_msg = bot.send_message(
         message.chat.id,
-        f"⏳ {action_title}\n━━━━━━━━━━━━━━━━━━\n🆔 UID: {uid}\n📌 Token refreshing...",
+        f"⏳ {action_title}{slot_text}\n━━━━━━━━━━━━━━━━━━\n🆔 UID: {uid}\n📌 Token refreshing...",
         parse_mode=None,
     )
     try:
-        code, output = run_single_token_update(set_name, uid, password)
-        token_file = UIDPASS_FILE_SETS[set_name][1]
+        code, output = run_single_token_update(set_name, uid, password, slot)
+        token_file = token_file_name(set_name, slot)
         if code == 0:
             text = "\n".join([
-                f"✅ {action_title}",
+                f"✅ {action_title}{slot_text}",
                 "━━━━━━━━━━━━━━━━━━",
                 f"🆔 UID: {uid}",
-                f"📄 UIDPASS File: {UIDPASS_FILE_SETS[set_name][0]}",
+                f"📄 UIDPASS File: {uidpass_file_name(set_name, slot)}",
                 f"🎟 Token File: {token_file}",
                 "✅ Token Result: Success",
             ])
         else:
             text = "\n".join([
-                f"⚠️ {action_title}",
+                f"⚠️ {action_title}{slot_text}",
                 "━━━━━━━━━━━━━━━━━━",
                 f"🆔 UID: {uid}",
-                f"📄 UIDPASS File: {UIDPASS_FILE_SETS[set_name][0]}",
+                f"📄 UIDPASS File: {uidpass_file_name(set_name, slot)}",
                 "❌ Token Result: Failed",
                 "",
                 output[-2500:] if output else f"Exit code {code}",
@@ -3162,42 +3598,133 @@ def process_single_uidpass_token_update(message, set_name, uid, password, action
         )
 
 
+def process_likeff_bulk_import(message, start_slot, items):
+    status_msg = bot.reply_to(
+        message,
+        f"⏳ Importing LikeFF accounts...\n━━━━━━━━━━━━━━━━━━\n📦 Start Slot: {start_slot}\n👥 Accounts: {len(items)}",
+        parse_mode=None,
+    )
+    added = []
+    duplicates = []
+    failed = []
+    for index, item in enumerate(items, 1):
+        try:
+            bot.edit_message_text(
+                chat_id=status_msg.chat.id,
+                message_id=status_msg.message_id,
+                text=f"⏳ Importing LikeFF accounts...\n━━━━━━━━━━━━━━━━━━\n📦 Start Slot: {start_slot}\n👥 Progress: {index}/{len(items)}\n🆔 UID: {item['uid']}",
+                parse_mode=None,
+            )
+        except Exception:
+            pass
+        try:
+            result = add_likeff_account_to_slot(start_slot, item["uid"], item["password"])
+            if result["status"] == "added":
+                added.append(result)
+            elif result["status"] == "duplicate":
+                duplicates.append(result)
+            else:
+                failed.append(result)
+        except Exception as exc:
+            failed.append({"uid": item["uid"], "status": "failed", "error": str(exc)})
+
+    slot_counts = {}
+    for item in added:
+        slot_counts[item["slot"]] = slot_counts.get(item["slot"], 0) + 1
+    lines = [
+        "✅ LIKEFF BULK IMPORT DONE",
+        "━━━━━━━━━━━━━━━━━━",
+        f"📦 Start Slot: {start_slot}",
+        f"👥 Total Found: {len(items)}",
+        f"✅ Added: {len(added)}",
+        f"ℹ️ Duplicate: {len(duplicates)}",
+        f"❌ Failed: {len(failed)}",
+    ]
+    if slot_counts:
+        lines.extend(["", "📦 Added By Slot:"])
+        for slot, count in sorted(slot_counts.items()):
+            lines.append(f"› Slot {slot}: {count}")
+    if failed:
+        lines.extend(["", "❌ Failed UID:"])
+        for item in failed[:10]:
+            lines.append(f"› {item.get('uid')}: {item.get('error', 'failed')}")
+        if len(failed) > 10:
+            lines.append(f"› ...and {len(failed) - 10} more")
+    bot.edit_message_text(chat_id=status_msg.chat.id, message_id=status_msg.message_id, text="\n".join(lines), parse_mode=None)
+
+
 @bot.message_handler(commands=["uidpass", "uidpassff"])
 def uidpass_command(message):
     if not is_owner(message.from_user.id):
         return
     command = (message.text.split()[0] or "").split("@", 1)[0].lstrip("/").lower()
     set_name = "likeff" if command == "uidpassff" else "like"
-    parts = message.text.split(maxsplit=3)
+    raw_parts = message.text.split()
     usage = f"⚠️ Invalid format.\n📌 Use: /{command} <ls|add|set|del|up> [uid] [password]"
-    if len(parts) < 2:
+    if set_name == "likeff":
+        usage += f"\n📦 Auto Slot: /{command} add <uid> <password>"
+        usage += f"\n📦 Manual Slot: /{command} <1-30> <ls|add|set|del|up> [uid] [password]"
+    if len(raw_parts) < 2:
         bot.reply_to(message, usage, parse_mode=None)
         return
 
-    action = parts[1].lower()
+    slot = None
+    action_index = 1
+    if set_name == "likeff" and raw_parts[1].isdigit():
+        slot = int(raw_parts[1])
+        if slot < 1 or slot > 30:
+            bot.reply_to(message, "⚠️ Invalid slot.\n📌 Slot must be 1-30.", parse_mode=None)
+            return
+        action_index = 2
+    if len(raw_parts) <= action_index:
+        bot.reply_to(message, usage, parse_mode=None)
+        return
+
+    action = raw_parts[action_index].lower()
     action = {
         "list": "ls",
+        "import": "bulk",
         "edit": "set",
         "update": "up",
         "delete": "del",
         "remove": "del",
     }.get(action, action)
 
+    if set_name == "likeff" and slot is None and action == "ls":
+        bot.reply_to(message, format_likeff_all_slots_summary(), parse_mode=None)
+        return
+
+    if set_name == "likeff" and slot and action in {"bulk", "json"}:
+        try:
+            raw_json = uidpass_json_from_message(message)
+            items = extract_uidpass_items(json.loads(raw_json))
+        except Exception as exc:
+            bot.reply_to(message, f"❌ LIKEFF BULK IMPORT FAILED\n━━━━━━━━━━━━━━━━━━\n{exc}\n\n📌 Reply to JSON text/file with:\n/uidpassff {slot} bulk", parse_mode=None)
+            return
+        if not items:
+            bot.reply_to(message, "ℹ️ No valid uid/password items found.", parse_mode=None)
+            return
+        threading.Thread(target=process_likeff_bulk_import, args=(message, slot, items), daemon=True).start()
+        return
+
     try:
-        accounts = load_uidpass(set_name)
+        accounts = load_uidpass(set_name, slot)
     except Exception as exc:
         bot.reply_to(message, f"❌ UIDPASS LOAD FAILED\n━━━━━━━━━━━━━━━━━━\n{exc}", parse_mode=None)
         return
 
     if action == "ls":
-        tokens = load_token_list(set_name)
+        tokens = load_token_list(set_name, slot)
         counts = region_counts(tokens)
+        bucket_counts = likeff_slot_bucket_counts(load_likeff_slot_meta(), slot) if set_name == "likeff" and slot else None
         lines = [
             "📊 UIDPASS SUMMARY",
             "━━━━━━━━━━━━━━━━━━",
-            f"📦 Set: {set_name}",
+            f"📦 Set: {set_name}" + (f" Slot {slot}" if slot else ""),
             f"👥 UIDPASS Accounts: {len(accounts)}",
             f"🎟 Tokens: {len(tokens)}",
+            f"📄 UIDPASS File: {uidpass_file_name(set_name, slot)}",
+            f"🎟 Token File: {token_file_name(set_name, slot)}",
             "",
             "🌍 Regions:",
         ]
@@ -3206,34 +3733,157 @@ def uidpass_command(message):
         else:
             for region, count in sorted(counts.items()):
                 lines.append(f"› {region}: {count}")
+        if bucket_counts:
+            lines.extend([
+                "",
+                "⭐ LikeFF Level Buckets:",
+                f"› Level 8-20: {bucket_counts.get('level_8_20', 0)}/{LIKEFF_LOW_LEVEL_MAX}",
+                f"› Level 21+: {bucket_counts.get('level_21_up', 0)}/{LIKEFF_HIGH_LEVEL_MAX}",
+            ])
         bot.reply_to(message, "\n".join(lines), parse_mode=None)
         return
 
     if action == "add":
-        if len(parts) < 4:
-            bot.reply_to(message, f"⚠️ Invalid format.\n📌 Use: /{command} add <uid> <password>", parse_mode=None)
+        if len(raw_parts) <= action_index + 2:
+            bot.reply_to(message, f"⚠️ Invalid format.\n📌 Use: /{command} " + (f"{slot} " if slot else "") + "add <uid> <password>", parse_mode=None)
             return
-        uid, password = parts[2], parts[3]
+        uid, password = raw_parts[action_index + 1], raw_parts[action_index + 2]
         if not uid.isdigit():
             bot.reply_to(message, "⚠️ Invalid UID.\n📌 UID must be a number.", parse_mode=None)
             return
+        if set_name == "likeff":
+            existing_slot = find_likeff_uid_existing_slot(uid)
+            if existing_slot:
+                bot.reply_to(message, f"ℹ️ UID already exists.\n📌 Slot: {existing_slot}\nUse set to change the password.", parse_mode=None)
+                return
+            start_slot = slot or 1
+            status_msg = bot.reply_to(message, "⏳ Generating token and checking LikeFF account...\n━━━━━━━━━━━━━━━━━━\nPlease wait.", parse_mode=None)
+            try:
+                token_item = generate_likeff_token_item(uid, password)
+                profile = fetch_likeff_account_profile_from_token(uid, token_item)
+                target_slot, bucket, slot_error = find_likeff_slot_for_level(start_slot, profile["level"])
+                if slot_error:
+                    bot.edit_message_text(chat_id=status_msg.chat.id, message_id=status_msg.message_id, text=f"❌ LIKEFF SLOT ADD FAILED\n━━━━━━━━━━━━━━━━━━\n{slot_error}", parse_mode=None)
+                    return
+                target_accounts = load_uidpass(set_name, target_slot)
+                target_accounts.append({"uid": uid, "password": password})
+                save_uidpass(set_name, target_accounts, target_slot)
+                upsert_token_item(set_name, token_item, target_slot)
+                save_likeff_slot_account(target_slot, uid, password, profile)
+                moved_text = "Auto" if slot is None else ("Yes" if target_slot != slot else "No")
+                bot.edit_message_text(
+                    chat_id=status_msg.chat.id,
+                    message_id=status_msg.message_id,
+                    text="\n".join([
+                        "✅ LIKEFF UIDPASS ACCOUNT ADDED",
+                        "━━━━━━━━━━━━━━━━━━",
+                        f"🆔 UID: {uid}",
+                        f"🎮 Account ID: {profile.get('account_id')}",
+                        f"👤 Name: {profile.get('name')}",
+                        f"🌍 Region: {profile.get('region')}",
+                        f"⭐ Level: {profile.get('level')}",
+                        f"📦 Slot: {target_slot}",
+                        f"↪️ Moved To New Slot: {moved_text}",
+                        f"📄 File: {uidpass_file_name(set_name, target_slot)}",
+                        f"🎟 Token File: {token_file_name(set_name, target_slot)}",
+                        "✅ Token Result: Success",
+                    ]),
+                    parse_mode=None,
+                )
+            except Exception as exc:
+                bot.edit_message_text(chat_id=status_msg.chat.id, message_id=status_msg.message_id, text=f"❌ LIKEFF ACCOUNT CHECK FAILED\n━━━━━━━━━━━━━━━━━━\n{exc}", parse_mode=None)
+            return
+        status_msg = bot.reply_to(message, "⏳ Generating token and checking account level...\n━━━━━━━━━━━━━━━━━━\nPlease wait.", parse_mode=None)
+        try:
+            token_item = generate_likeff_token_item(uid, password)
+            profile = fetch_likeff_account_profile_from_token(uid, token_item)
+            level = int(profile.get("level") or 0)
+        except Exception as exc:
+            bot.edit_message_text(chat_id=status_msg.chat.id, message_id=status_msg.message_id, text=f"❌ UIDPASS ACCOUNT CHECK FAILED\n━━━━━━━━━━━━━━━━━━\n{exc}", parse_mode=None)
+            return
+
+        if level < 8:
+            bot.edit_message_text(
+                chat_id=status_msg.chat.id,
+                message_id=status_msg.message_id,
+                text="\n".join([
+                    "❌ UIDPASS ACCOUNT REJECTED",
+                    "━━━━━━━━━━━━━━━━━━",
+                    f"🆔 UID: {uid}",
+                    f"🎮 Account ID: {profile.get('account_id')}",
+                    f"👤 Name: {profile.get('name')}",
+                    f"🌍 Region: {profile.get('region')}",
+                    f"⭐ Level: {level}",
+                    "📌 Required Level: 8+",
+                ]),
+                parse_mode=None,
+            )
+            return
+
+        if level >= 21:
+            existing_slot = find_likeff_uid_existing_slot(uid)
+            if existing_slot:
+                bot.edit_message_text(chat_id=status_msg.chat.id, message_id=status_msg.message_id, text=f"ℹ️ UID already exists in LikeFF.\n━━━━━━━━━━━━━━━━━━\n🆔 UID: {uid}\n📦 Slot: {existing_slot}", parse_mode=None)
+                return
+            target_slot, bucket, slot_error = find_likeff_slot_for_level(1, level)
+            if slot_error:
+                bot.edit_message_text(chat_id=status_msg.chat.id, message_id=status_msg.message_id, text=f"❌ LIKEFF SLOT ADD FAILED\n━━━━━━━━━━━━━━━━━━\n{slot_error}", parse_mode=None)
+                return
+            target_accounts = load_uidpass("likeff", target_slot)
+            target_accounts.append({"uid": uid, "password": password})
+            save_uidpass("likeff", target_accounts, target_slot)
+            upsert_token_item("likeff", token_item, target_slot)
+            save_likeff_slot_account(target_slot, uid, password, profile)
+            bot.edit_message_text(
+                chat_id=status_msg.chat.id,
+                message_id=status_msg.message_id,
+                text="\n".join([
+                    "✅ UIDPASS MOVED TO LIKEFF",
+                    "━━━━━━━━━━━━━━━━━━",
+                    f"🆔 UID: {uid}",
+                    f"🎮 Account ID: {profile.get('account_id')}",
+                    f"👤 Name: {profile.get('name')}",
+                    f"🌍 Region: {profile.get('region')}",
+                    f"⭐ Level: {level}",
+                    f"📦 Slot: {target_slot}",
+                    f"📄 File: {uidpass_file_name('likeff', target_slot)}",
+                    f"🎟 Token File: {token_file_name('likeff', target_slot)}",
+                    "✅ Token Result: Success",
+                ]),
+                parse_mode=None,
+            )
+            return
+
         if find_uidpass_index(accounts, uid) != -1:
-            bot.reply_to(message, "ℹ️ UID already exists.\n📌 Use set to change the password.", parse_mode=None)
+            bot.edit_message_text(chat_id=status_msg.chat.id, message_id=status_msg.message_id, text="ℹ️ UID already exists.\n📌 Use set to change the password.", parse_mode=None)
             return
         accounts.append({"uid": uid, "password": password})
-        save_uidpass(set_name, accounts)
-        threading.Thread(
-            target=process_single_uidpass_token_update,
-            args=(message, set_name, uid, password, "UIDPASS ACCOUNT ADDED"),
-            daemon=True,
-        ).start()
+        save_uidpass(set_name, accounts, slot)
+        upsert_token_item(set_name, token_item, slot)
+        bot.edit_message_text(
+            chat_id=status_msg.chat.id,
+            message_id=status_msg.message_id,
+            text="\n".join([
+                "✅ UIDPASS ACCOUNT ADDED",
+                "━━━━━━━━━━━━━━━━━━",
+                f"🆔 UID: {uid}",
+                f"🎮 Account ID: {profile.get('account_id')}",
+                f"👤 Name: {profile.get('name')}",
+                f"🌍 Region: {profile.get('region')}",
+                f"⭐ Level: {level}",
+                f"📄 File: {uidpass_file_name(set_name, slot)}",
+                f"🎟 Token File: {token_file_name(set_name, slot)}",
+                "✅ Token Result: Success",
+            ]),
+            parse_mode=None,
+        )
         return
 
     if action == "set":
-        if len(parts) < 4:
-            bot.reply_to(message, f"⚠️ Invalid format.\n📌 Use: /{command} set <uid> <new_password>", parse_mode=None)
+        if len(raw_parts) <= action_index + 2:
+            bot.reply_to(message, f"⚠️ Invalid format.\n📌 Use: /{command} " + (f"{slot} " if slot else "") + "set <uid> <new_password>", parse_mode=None)
             return
-        uid, password = parts[2], parts[3]
+        uid, password = raw_parts[action_index + 1], raw_parts[action_index + 2]
         if not uid.isdigit():
             bot.reply_to(message, "⚠️ Invalid UID.\n📌 UID must be a number.", parse_mode=None)
             return
@@ -3242,30 +3892,54 @@ def uidpass_command(message):
             bot.reply_to(message, "ℹ️ UID not found.", parse_mode=None)
             return
         accounts[index]["password"] = password
-        save_uidpass(set_name, accounts)
+        save_uidpass(set_name, accounts, slot)
+        if set_name == "likeff" and slot:
+            try:
+                token_item = generate_likeff_token_item(uid, password)
+                upsert_token_item(set_name, token_item, slot)
+                profile = fetch_likeff_account_profile_from_token(uid, token_item)
+                save_likeff_slot_account(slot, uid, password, profile)
+            except Exception:
+                pass
         threading.Thread(
             target=process_single_uidpass_token_update,
-            args=(message, set_name, uid, password, "UIDPASS ACCOUNT UPDATED"),
+            args=(message, set_name, uid, password, "UIDPASS ACCOUNT UPDATED", slot),
             daemon=True,
         ).start()
         return
 
     if action == "del":
-        if len(parts) < 3 or not parts[2].isdigit():
-            bot.reply_to(message, f"⚠️ Invalid format.\n📌 Use: /{command} del <uid>", parse_mode=None)
+        if len(raw_parts) <= action_index + 1 or not raw_parts[action_index + 1].isdigit():
+            bot.reply_to(message, f"⚠️ Invalid format.\n📌 Use: /{command} " + (f"{slot} " if slot else "") + "del <uid>", parse_mode=None)
             return
-        uid = parts[2]
+        uid = raw_parts[action_index + 1]
         index = find_uidpass_index(accounts, uid)
         if index == -1:
             bot.reply_to(message, "ℹ️ UID not found.", parse_mode=None)
             return
         accounts.pop(index)
-        save_uidpass(set_name, accounts)
-        bot.reply_to(message, f"✅ UIDPASS ACCOUNT DELETED\n━━━━━━━━━━━━━━━━━━\n🆔 UID: {uid}\n📄 File: {UIDPASS_FILE_SETS[set_name][0]}", parse_mode=None)
+        save_uidpass(set_name, accounts, slot)
+        removed_tokens = 0
+        if slot:
+            removed_tokens = delete_token_item(set_name, uid, slot)
+        if set_name == "likeff" and slot:
+            remove_likeff_slot_account(slot, uid)
+        bot.reply_to(
+            message,
+            "\n".join([
+                "✅ UIDPASS ACCOUNT DELETED",
+                "━━━━━━━━━━━━━━━━━━",
+                f"🆔 UID: {uid}",
+                f"📄 UIDPASS File: {uidpass_file_name(set_name, slot)}",
+                f"🎟 Tokens Removed: {removed_tokens}",
+                f"🎟 Token File: {token_file_name(set_name, slot)}",
+            ]),
+            parse_mode=None,
+        )
         return
 
     if action == "up":
-        threading.Thread(target=process_uidpass_update, args=(message, set_name), daemon=True).start()
+        threading.Thread(target=process_uidpass_update, args=(message, set_name, slot), daemon=True).start()
         return
 
     bot.reply_to(message, usage, parse_mode=None)
@@ -4089,18 +4763,18 @@ def watch_text(message):
             bot.reply_to(message, note, parse_mode=None)
 
 
-def process_autolikeff_orders():
+def process_autolike_orders(kind="likeff"):
     while True:
         try:
             now = datetime.now(CAMBODIA_TZ)
-            run_time = autolike_run_datetime(now)
+            run_time = autolike_run_datetime(now, kind)
             if now < run_time:
                 time.sleep(min(AUTOLIKEFF_CHECK_INTERVAL, max(1, (run_time - now).total_seconds())))
                 continue
 
             period = current_autolike_period(now)
             with autolike_lock:
-                orders = load_autolike_orders()
+                orders = load_autolike_orders(kind)
 
             changed = False
             for order in orders:
@@ -4117,16 +4791,20 @@ def process_autolikeff_orders():
                 if order.get("last_attempt_period") == period or order.get("last_period") == period:
                     continue
 
-                deliver_autolikeff_order(order, period=period, schedule_next=True)
+                deliver_autolike_order(order, kind, period=period, schedule_next=True)
                 changed = True
                 time.sleep(AUTOLIKEFF_ORDER_DELAY)
 
             if changed:
                 with autolike_lock:
-                    merge_save_autolike_orders(orders)
+                    merge_save_autolike_orders(orders, kind)
         except Exception:
-            logger.exception("AutoLikeFF worker failed")
+            logger.exception("%s worker failed", autolike_label(kind))
         time.sleep(AUTOLIKEFF_CHECK_INTERVAL)
+
+
+def process_autolikeff_orders():
+    process_autolike_orders("likeff")
 
 
 def autolike_notice_datetime(value=None):
@@ -4196,13 +4874,14 @@ def process_auto_token_refresh():
     while True:
         try:
             logger.info("Starting automatic token refresh for all token sets")
-            for set_name in UIDPASS_FILE_SETS:
+            for set_name, slot in token_refresh_targets():
+                label = f"{set_name} slot {slot}" if slot else set_name
                 try:
-                    code, output = run_token_update(set_name)
+                    code, output = run_token_update(set_name, slot)
                     if code == 0:
-                        logger.info("Automatic token refresh completed for %s", set_name)
+                        logger.info("Automatic token refresh completed for %s", label)
                     else:
-                        logger.warning("Automatic token refresh failed for %s: %s", set_name, output[-1000:])
+                        logger.warning("Automatic token refresh failed for %s: %s", label, output[-1000:])
                         if OWNER_ID:
                             report = output
                             marker = "UID/PASS Token Refresh Report"
@@ -4210,7 +4889,7 @@ def process_auto_token_refresh():
                                 line_start = report.rfind("\n", 0, report.find(marker))
                                 report = report[(line_start + 1) if line_start >= 0 else report.find(marker):]
                             text = "\n".join([
-                                f"⚠️ {set_name.upper()} TOKEN REFRESH FAILED",
+                                f"⚠️ {label.upper()} TOKEN REFRESH FAILED",
                                 "━━━━━━━━━━━━━━━━━━",
                                 report[:3500],
                             ])
@@ -4219,7 +4898,7 @@ def process_auto_token_refresh():
                             except Exception as send_exc:
                                 logger.warning("Could not send token refresh report to owner: %s", send_exc)
                 except Exception as exc:
-                    logger.warning("Automatic token refresh crashed for %s: %s", set_name, exc)
+                    logger.warning("Automatic token refresh crashed for %s: %s", label, exc)
             logger.info("Next automatic token refresh in 7 hours")
         except Exception:
             logger.exception("Automatic token refresh worker failed")
@@ -4273,6 +4952,7 @@ if __name__ == "__main__":
     if not acquire_bot_instance_lock():
         raise SystemExit(1)
     threading.Thread(target=reset_limits, daemon=True).start()
+    threading.Thread(target=process_autolike_orders, args=("like",), daemon=True).start()
     threading.Thread(target=process_autolikeff_orders, daemon=True).start()
     threading.Thread(target=process_autolikeff_near_end_notices, daemon=True).start()
     threading.Thread(target=process_auto_token_refresh, daemon=True).start()

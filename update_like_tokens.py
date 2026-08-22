@@ -11,6 +11,28 @@ FILE_SETS = {
 }
 
 
+def parse_args(argv):
+    args = list(argv)
+    slot = None
+    if "--slot" in args:
+        index = args.index("--slot")
+        try:
+            slot = int(args[index + 1])
+        except (IndexError, ValueError):
+            raise ValueError("--slot requires a number")
+        del args[index:index + 2]
+    return args, slot
+
+
+def slot_filename(filename, set_name, slot=None):
+    if set_name == "likeff" and slot:
+        root, dot, ext = filename.rpartition(".")
+        if not dot:
+            return f"{filename}_{slot}"
+        return f"{root}_{slot}.{ext}"
+    return filename
+
+
 def read_uidpass(uidpass_file):
     with open(uidpass_file, "r", encoding="utf-8") as f:
         data = json.load(f)
@@ -20,7 +42,12 @@ def read_uidpass(uidpass_file):
 
 
 def fetch_jwt(uid, password):
-    return lssj.fetch_guest_jwt_for_like_with_retry(uid, password)
+    try:
+        return lssj.fetch_guest_jwt_for_like_with_retry(uid, password)
+    except BaseException as exc:
+        if isinstance(exc, KeyboardInterrupt):
+            raise
+        raise RuntimeError(str(exc) or exc.__class__.__name__) from None
 
 
 def update_token_file(tokens, token_file):
@@ -37,12 +64,19 @@ def read_tokens(token_file):
         return []
 
 
-def update_single_token(set_name, uid, password):
+def update_single_token(set_name, uid, password, slot=None):
     if set_name not in FILE_SETS:
         print(f"Unknown token set: {set_name}. Use one of: {', '.join(FILE_SETS)}")
         return 2
     _, token_file = FILE_SETS[set_name]
-    token_item = fetch_jwt(uid, password)
+    token_file = slot_filename(token_file, set_name, slot)
+    try:
+        token_item = fetch_jwt(uid, password)
+    except BaseException as exc:
+        if isinstance(exc, KeyboardInterrupt):
+            raise
+        print(f"failed UID {uid}: {exc}")
+        return 1
     tokens = read_tokens(token_file)
     uid = str(uid)
     replaced = False
@@ -62,13 +96,20 @@ def update_single_token(set_name, uid, password):
 
 
 def main():
-    set_name = sys.argv[1].lower() if len(sys.argv) > 1 else "like"
-    if len(sys.argv) >= 4:
-        return update_single_token(set_name, sys.argv[2], sys.argv[3])
+    try:
+        args, slot = parse_args(sys.argv[1:])
+    except ValueError as exc:
+        print(str(exc))
+        return 2
+    set_name = args[0].lower() if len(args) > 0 else "like"
+    if len(args) >= 3:
+        return update_single_token(set_name, args[1], args[2], slot)
     if set_name not in FILE_SETS:
         print(f"Unknown token set: {set_name}. Use one of: {', '.join(FILE_SETS)}")
         return 2
     uidpass_file, token_file = FILE_SETS[set_name]
+    uidpass_file = slot_filename(uidpass_file, set_name, slot)
+    token_file = slot_filename(token_file, set_name, slot)
     accounts = read_uidpass(uidpass_file)
     tokens = []
     failures = []
@@ -89,7 +130,9 @@ def main():
         try:
             tokens.append(fetch_jwt(uid, password))
             print(f"updated token for UID {uid}")
-        except Exception as e:
+        except BaseException as e:
+            if isinstance(e, KeyboardInterrupt):
+                raise
             failures.append({"uid": uid, "password": password, "error": str(e)})
             print(f"failed UID {uid}: {e}")
 

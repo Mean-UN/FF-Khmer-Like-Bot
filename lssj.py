@@ -57,6 +57,9 @@ UIDPASS_FILE = "uidpass.json"
 LIKE_TOKEN_FILE = "tokens.json"
 LIKEFF_UIDPASS_FILE = "uidpass_likeff.json"
 LIKEFF_TOKEN_FILE = "tokens_likeff.json"
+LIKEFF_SLOT_STATE_FILE = "likeff_slot_usage.json"
+LIKEFF_SLOT_COUNT = 30
+LIKEFF_UIDS_PER_SLOT = 30
 REGION_CACHE_FILE = "regions.json"
 LIKE_TOKEN_MAX_RETRIES = 10
 LIKE_TOKEN_RETRY_DELAY = 0.7
@@ -640,15 +643,7 @@ def decode_jwt_payload(token):
     except Exception:
         return {}
 
-def load_like_tokens(region=None, token_file=LIKE_TOKEN_FILE):
-    try:
-        with open(token_file, "r", encoding="utf-8") as f:
-            items = json.load(f)
-    except FileNotFoundError:
-        return []
-    except Exception:
-        return []
-
+def token_items_to_bearers(items, region=None):
     region = normalize_region(region) if region else None
     tokens = []
     for item in items if isinstance(items, list) else []:
@@ -664,6 +659,55 @@ def load_like_tokens(region=None, token_file=LIKE_TOKEN_FILE):
         if normalized:
             tokens.append(normalized)
     return tokens
+
+def get_slot_items(data, slot):
+    slot_key = str(slot)
+    if isinstance(data, dict):
+        slots = data.get("slots")
+        if isinstance(slots, dict):
+            return slots.get(slot_key) or slots.get(int(slot)) or []
+        if isinstance(slots, list):
+            for item in slots:
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("slot") or item.get("id") or "") == slot_key:
+                    return item.get("tokens") or item.get("items") or []
+        direct = data.get(slot_key) or data.get(f"slot_{slot_key}")
+        if isinstance(direct, list):
+            return direct
+    if isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict) and str(item.get("slot") or item.get("id") or "") == slot_key:
+                return item.get("tokens") or item.get("items") or []
+    return []
+
+def load_like_tokens(region=None, token_file=LIKE_TOKEN_FILE, slot=None):
+    items = []
+    try:
+        with open(token_file, "r", encoding="utf-8") as f:
+            items = json.load(f)
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+
+    if slot is not None:
+        slot_items = get_slot_items(items, slot)
+        if slot_items:
+            return token_items_to_bearers(slot_items, region)
+
+        base, ext = os.path.splitext(token_file)
+        for candidate in (f"{base}_{slot}{ext}", f"{base}_slot{slot}{ext}", f"{base}_slot_{slot}{ext}"):
+            try:
+                with open(candidate, "r", encoding="utf-8") as f:
+                    candidate_items = json.load(f)
+                tokens = token_items_to_bearers(candidate_items, region)
+                if tokens:
+                    return tokens
+            except Exception:
+                continue
+
+    return token_items_to_bearers(items, region)
 
 def load_region_cache():
     try:
@@ -700,6 +744,71 @@ def set_cached_region(uid, region):
         "updated_at": datetime.now(CAMBODIA_TZ).isoformat(),
     }
     save_region_cache(cache)
+
+def current_likeff_slot_date():
+    return datetime.now(CAMBODIA_TZ).date().isoformat()
+
+def load_likeff_slot_usage():
+    try:
+        with open(LIKEFF_SLOT_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        return {}
+
+def save_likeff_slot_usage(data):
+    with open(LIKEFF_SLOT_STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=4)
+
+def current_likeff_slot_usage():
+    today = current_likeff_slot_date()
+    data = load_likeff_slot_usage()
+    if data.get("date") != today:
+        data = {"date": today, "assignments": {}}
+    data.setdefault("assignments", {})
+    changed = data.pop("exhausted_slots", None) is not None
+
+    assignments = data.get("assignments", {})
+    if isinstance(assignments, dict) and len(assignments) > 1:
+        slot_counts = {}
+        for assigned_slot in assignments.values():
+            if str(assigned_slot).isdigit():
+                assigned_slot = int(assigned_slot)
+                slot_counts[assigned_slot] = slot_counts.get(assigned_slot, 0) + 1
+
+        if slot_counts and max(slot_counts.values()) <= 1:
+            data["assignments"] = {
+                str(uid): (index // LIKEFF_UIDS_PER_SLOT) + 1
+                for index, uid in enumerate(assignments.keys())
+            }
+            changed = True
+
+    if changed:
+        save_likeff_slot_usage(data)
+    return data
+
+def assign_likeff_slot(uid):
+    uid = str(uid)
+    data = current_likeff_slot_usage()
+    assignments = data["assignments"]
+    existing = assignments.get(uid)
+    if existing:
+        return int(existing), False
+
+    slot_counts = {}
+    for assigned_slot in assignments.values():
+        if str(assigned_slot).isdigit():
+            assigned_slot = int(assigned_slot)
+            slot_counts[assigned_slot] = slot_counts.get(assigned_slot, 0) + 1
+    for slot in range(1, LIKEFF_SLOT_COUNT + 1):
+        if slot_counts.get(slot, 0) < LIKEFF_UIDS_PER_SLOT:
+            assignments[uid] = slot
+            save_likeff_slot_usage(data)
+            return slot, True
+
+    raise RuntimeError(f"All {LIKEFF_SLOT_COUNT} LikeFF slots are already full today")
 
 def fetch_guest_jwt_for_like(uid, password):
     uid_int = int(uid)
@@ -1446,7 +1555,7 @@ def access_token_api():
     status = 200 if result.get("success") else 502
     return jsonify(result), status
 
-def run_like_api(token_file, endpoint_name):
+def run_like_api(token_file, endpoint_name, auto_slot=False):
     uid = request.args.get("uid")
     requested_region = request.args.get("server_name") or request.args.get("region")
 
@@ -1474,7 +1583,16 @@ def run_like_api(token_file, endpoint_name):
         return jsonify({"success": False, "error": f"Unsupported region: {region}"}), 400
 
     try:
-        like_tokens = load_like_tokens(token_file=token_file)
+        slot = None
+        slot_new = False
+        if auto_slot:
+            slot, slot_new = assign_likeff_slot(uid)
+
+        like_tokens = load_like_tokens(token_file=token_file, slot=slot)
+        if not like_tokens:
+            slot_msg = f" for slot {slot}" if slot else ""
+            return jsonify({"success": False, "error": f"No {endpoint_name} tokens configured{slot_msg}"}), 503
+
         before = asyncio.run(fetch_like_info_with_tokens(uid, region, like_tokens))
         before_info = get_like_account_info(before)
         before_likes = int(before_info.get("Likes", 0) or 0)
@@ -1486,7 +1604,7 @@ def run_like_api(token_file, endpoint_name):
         after_likes = int(after_info.get("Likes", 0) or 0)
         likes_given = after_likes - before_likes
 
-        return jsonify({
+        payload = {
             "success": True,
             "LikesGivenByAPI": likes_given,
             "LikesafterCommand": after_likes,
@@ -1495,7 +1613,20 @@ def run_like_api(token_file, endpoint_name):
             "Region": detected_region or region,
             "UID": int(after_info.get("UID", uid) or uid),
             "status": 1 if likes_given > 0 else 2,
-        }), 200
+            "slot": slot,
+            "slot_new": slot_new,
+            "tokens_used": len(like_tokens),
+        }
+
+        if auto_slot and slot:
+            usage = current_likeff_slot_usage()
+            slot_count = sum(
+                1 for assigned_slot in usage.get("assignments", {}).values()
+                if str(assigned_slot) == str(slot)
+            )
+            payload["slot_usage"] = f"{slot_count}/{LIKEFF_UIDS_PER_SLOT}"
+
+        return jsonify(payload), 200
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
@@ -1505,7 +1636,7 @@ def like_api():
 
 @FAHHHH.route('/likeff', methods=['GET'])
 def likeff_api():
-    return run_like_api(LIKEFF_TOKEN_FILE, "likeff")
+    return run_like_api(LIKEFF_TOKEN_FILE, "likeff", auto_slot=True)
 
 @FAHHHH.route('/meanffinfo')
 def OMG():
@@ -1787,6 +1918,5 @@ def WTF():
 
 if __name__ == "__main__":
     threading.Thread(target=update_like_tokens_from_uidpass, daemon=True).start()
-    threading.Thread(target=update_likeff_tokens_from_uidpass, daemon=True).start()
     port = int(os.environ.get("PORT", 5000))
     FAHHHH.run(host="0.0.0.0", port=port)
