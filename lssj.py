@@ -13,6 +13,7 @@ import string
 import codecs
 import os
 import ipaddress
+from email.utils import parsedate_to_datetime
 from urllib.parse import urlparse, parse_qs, quote
 from collections import defaultdict
 from functools import wraps
@@ -511,11 +512,15 @@ def generate_custom_password(user_prefix):
 def major_register_url(region, is_ghost=False):
     if is_ghost:
         return "https://loginbp.ggblueshark.com/MajorRegister"
+    if normalize_region(region) in {"ME", "TH"}:
+        return "https://loginbp.common.ggbluefox.com/MajorRegister"
     return "https://loginbp.ggblueshark.com/MajorRegister"
 
 def major_login_url(region, is_ghost=False):
     if is_ghost:
         return "https://loginbp.ggblueshark.com/MajorLogin"
+    if normalize_region(region) in {"ME", "TH"}:
+        return "https://loginbp.common.ggbluefox.com/MajorLogin"
     return "https://loginbp.ggblueshark.com/MajorLogin"
 
 def get_region_proxies(region):
@@ -558,14 +563,38 @@ def get_region_ip(region):
     return random_ip_from_cidr(random.choice(cidrs))
 
 def with_region_ip_headers(headers, region):
-    client_ip = get_region_ip(region)
-    updated = headers.copy()
-    updated["X-Forwarded-For"] = client_ip
-    updated["X-Real-IP"] = client_ip
-    updated["Client-IP"] = client_ip
-    updated["CF-Connecting-IP"] = client_ip
-    updated["True-Client-IP"] = client_ip
-    return updated
+    return headers.copy()
+
+def retry_after_seconds(response):
+    value = response.headers.get("Retry-After")
+    if not value:
+        return None
+    try:
+        return max(0, int(value))
+    except ValueError:
+        pass
+    try:
+        retry_at = parsedate_to_datetime(value)
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=timezone.utc)
+        return max(0, int((retry_at - datetime.now(timezone.utc)).total_seconds()))
+    except Exception:
+        return None
+
+def rate_limit_result(response, password, region, stage, guest_created=False, uid=None):
+    result = {
+        "success": False,
+        "guest_created": guest_created,
+        "uid": uid,
+        "password": password,
+        "requested_region": "GHOST" if region == "GHOST" else region,
+        "error": f"{stage} rate limited with status 429",
+        "details": response.text[:500],
+    }
+    retry_after = retry_after_seconds(response)
+    if retry_after is not None:
+        result["retry_after_seconds"] = retry_after
+    return result
 
 def response_json_or_text(response):
     try:
@@ -936,6 +965,13 @@ def is_region_match(requested_region, actual_region):
         return True
     return not actual_region or requested_region == actual_region
 
+def create_account_http_status(result):
+    if result.get("guest_created"):
+        return 200
+    if "status 429" in result.get("error", ""):
+        return 429
+    return 502
+
 def create_guest_account(region, account_name, password_prefix, is_ghost=False):
     region = normalize_region(region)
     errors = []
@@ -989,6 +1025,8 @@ def create_guest_account_with_proxy(region, account_name, password_prefix, is_gh
         verify=False,
         proxies=proxies,
     )
+    if register_response.status_code == 429:
+        return rate_limit_result(register_response, password, region, "Guest register")
     if register_response.status_code != 200:
         return {
             "success": False,
@@ -1068,6 +1106,8 @@ def create_guest_account_with_proxy(region, account_name, password_prefix, is_gh
         )
         if token_response.status_code == 200:
             break
+        if token_response.status_code == 429:
+            return rate_limit_result(token_response, password, region, "Token grant", guest_created=True, uid=uid)
         token_errors.append({
             "url": attempt["url"],
             "status_code": token_response.status_code,
@@ -1137,6 +1177,19 @@ def create_guest_account_with_proxy(region, account_name, password_prefix, is_gh
         verify=False,
         proxies=proxies,
     )
+    if major_register_response.status_code == 429:
+        requested_region = "GHOST" if is_ghost else region
+        result = rate_limit_result(major_register_response, password, requested_region, "Major register", guest_created=True, uid=uid)
+        result.update({
+            "success": True,
+            "name": name,
+            "region": requested_region,
+            "access_token": access_token,
+            "account_id": None,
+            "jwt_token": None,
+            "warning": result.pop("error"),
+        })
+        return result
 
     req_msg = build_major_login_request(open_id, access_token)
     login_url = major_login_url(region, is_ghost)
@@ -1159,6 +1212,21 @@ def create_guest_account_with_proxy(region, account_name, password_prefix, is_gh
         verify=False,
         proxies=proxies,
     )
+    if login_response.status_code == 429:
+        requested_region = "GHOST" if is_ghost else region
+        result = rate_limit_result(login_response, password, requested_region, "Major login", guest_created=True, uid=uid)
+        result.update({
+            "success": True,
+            "name": name,
+            "region": requested_region,
+            "access_token": access_token,
+            "account_id": None,
+            "jwt_token": None,
+            "major_register_status": major_register_response.status_code,
+            "major_login_success": False,
+            "warning": result.pop("error"),
+        })
+        return result
 
     account_id = None
     jwt_token = None
@@ -1896,7 +1964,7 @@ def create_account_api():
         is_ghost = region.upper() == "GHOST"
         password_prefix = f"{account_name}_{region}".upper()
         result = create_guest_account(region, account_name, password_prefix, is_ghost)
-        return jsonify(result), 200 if result.get("guest_created") else 502
+        return jsonify(result), create_account_http_status(result)
     except requests.HTTPError as e:
         status_code = e.response.status_code if e.response is not None else 502
         body = e.response.text[:500] if e.response is not None else str(e)
