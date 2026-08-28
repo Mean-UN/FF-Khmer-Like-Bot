@@ -3317,6 +3317,8 @@ def process_guestgen(message, region, name, total=None, file_mode=False):
             accounts.append(guest_account_record(data))
         else:
             failures.append(data.get("error") or data.get("warning") or "Guest account generation failed")
+            if data.get("rate_limited"):
+                break
 
     if not accounts:
         error_text = failures[0] if failures else "Guest account generation failed"

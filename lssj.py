@@ -13,6 +13,7 @@ import string
 import codecs
 import os
 import ipaddress
+import re
 from urllib.parse import urlparse, parse_qs, quote
 from collections import defaultdict
 from functools import wraps
@@ -44,9 +45,12 @@ else:
     FAHHHH.config["JSON_SORT_KEYS"] = False
 
 http_session = requests.Session()
+thread_local = threading.local()
 TOKENS = defaultdict(dict)
 UID_MEMORY = {}
 REGION_CACHE_LOCK = threading.Lock()
+GUEST_REGISTER_COOLDOWN_LOCK = threading.Lock()
+GUEST_REGISTER_COOLDOWNS = {}
 HTTP_TIMEOUT = httpx.Timeout(15.0, connect=10.0)
 CLIENT_SECRET = "2ee44819e9b4598845141067b281621874d0d5d7af9d8f7e00c1e54715b7d1e3"
 CLIENT_ID = "100067"
@@ -73,6 +77,16 @@ BIO_UPDATE_URLS = [
     "https://client.us.freefiremobile.com/UpdateSocialBasicInfo",
     "https://clientbp.common.ggbluefox.com/UpdateSocialBasicInfo",
 ]
+
+def get_http_session():
+    session = getattr(thread_local, "session", None)
+    if session is None:
+        session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=50, max_retries=0)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        thread_local.session = session
+    return session
 BIO_HEADERS = {
     "Expect": "100-continue",
     "X-Unity-Version": "2018.4.11f1",
@@ -506,7 +520,9 @@ def generate_random_name(base):
     return f"{base}{generate_exponent()}"
 
 def generate_custom_password(user_prefix):
-    return "MEAN" + ''.join(random.choice('0123456789ABCDEF') for _ in range(60))
+    safe_prefix = re.sub(r"[^A-Z0-9_]", "", str(user_prefix or "MEAN").upper())[:24] or "MEAN"
+    random_part = ''.join(random.choice(string.ascii_uppercase + string.digits) for _ in range(12))
+    return f"{safe_prefix}_{random_part}"
 
 def major_register_url(region, is_ghost=False):
     if is_ghost:
@@ -936,14 +952,53 @@ def is_region_match(requested_region, actual_region):
         return True
     return not actual_region or requested_region == actual_region
 
+def guest_register_cooldown_key(region, is_ghost=False):
+    return "GHOST" if is_ghost else normalize_region(region)
+
+def guest_register_retry_after(response, default=900):
+    try:
+        retry_after = int(response.headers.get("Retry-After", ""))
+        return max(60, min(retry_after, 3600))
+    except (TypeError, ValueError):
+        return default
+
+def set_guest_register_cooldown(region, seconds, is_ghost=False):
+    key = guest_register_cooldown_key(region, is_ghost)
+    with GUEST_REGISTER_COOLDOWN_LOCK:
+        GUEST_REGISTER_COOLDOWNS[key] = time.time() + max(60, int(seconds or 0))
+
+def get_guest_register_cooldown(region, is_ghost=False):
+    key = guest_register_cooldown_key(region, is_ghost)
+    with GUEST_REGISTER_COOLDOWN_LOCK:
+        until = GUEST_REGISTER_COOLDOWNS.get(key, 0)
+        remaining = int(until - time.time())
+        if remaining <= 0:
+            GUEST_REGISTER_COOLDOWNS.pop(key, None)
+            return 0
+        return remaining
+
 def create_guest_account(region, account_name, password_prefix, is_ghost=False):
     region = normalize_region(region)
+    cooldown_remaining = get_guest_register_cooldown(region, is_ghost)
+    if cooldown_remaining:
+        return {
+            "success": False,
+            "guest_created": False,
+            "uid": None,
+            "password": None,
+            "requested_region": "GHOST" if is_ghost else region,
+            "error": f"Guest register is rate-limited. Try again in {cooldown_remaining} seconds.",
+            "rate_limited": True,
+            "retry_after": cooldown_remaining,
+        }
     errors = []
     max_attempts = 5 if not is_ghost else 1
     for _ in range(max_attempts):
         for proxy_url in get_region_proxy_candidates(region):
             try:
                 result = create_guest_account_with_proxy(region, account_name, password_prefix, is_ghost, proxy_url)
+                if result.get("rate_limited"):
+                    return result
                 actual_region = result.get("region")
                 if result.get("success") and not is_region_match(region, actual_region):
                     errors.append({
@@ -973,6 +1028,7 @@ def create_guest_account_with_proxy(region, account_name, password_prefix, is_gh
     password = generate_custom_password(password_prefix)
     region = normalize_region(region)
     proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+    session = get_http_session()
     register_headers = with_region_ip_headers({
         "Accept": "application/json",
         "Content-Type": "application/json; charset=utf-8",
@@ -981,7 +1037,7 @@ def create_guest_account_with_proxy(region, account_name, password_prefix, is_gh
         "Host": "100067.connect.garena.com",
         "User-Agent": "GarenaMSDK/4.0.39(SM-A325M;Android 13;en;HK;)",
     }, region)
-    register_response = http_session.post(
+    register_response = session.post(
         "https://100067.connect.garena.com/api/v2/oauth/guest:register",
         headers=register_headers,
         json={"app_id": 100067, "client_type": 2, "password": password, "source": 2},
@@ -989,6 +1045,20 @@ def create_guest_account_with_proxy(region, account_name, password_prefix, is_gh
         verify=False,
         proxies=proxies,
     )
+    if register_response.status_code == 429:
+        retry_after = guest_register_retry_after(register_response)
+        set_guest_register_cooldown(region, retry_after, is_ghost)
+        return {
+            "success": False,
+            "guest_created": False,
+            "uid": None,
+            "password": password,
+            "requested_region": "GHOST" if is_ghost else region,
+            "error": f"Guest register is rate-limited. Try again in {retry_after} seconds.",
+            "details": register_response.text[:500],
+            "rate_limited": True,
+            "retry_after": retry_after,
+        }
     if register_response.status_code != 200:
         return {
             "success": False,
@@ -1058,7 +1128,7 @@ def create_guest_account_with_proxy(region, account_name, password_prefix, is_gh
     ]
     token_errors = []
     for attempt in token_attempts:
-        token_response = http_session.post(
+        token_response = session.post(
             attempt["url"],
             headers=attempt["headers"],
             timeout=15,
@@ -1129,7 +1199,7 @@ def create_guest_account_with_proxy(region, account_name, password_prefix, is_gh
         "X-Unity-Version": "2018.4.11f1",
         "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_I005DA Build/PI)",
     }, region)
-    major_register_response = http_session.post(
+    major_register_response = session.post(
         reg_url,
         headers=major_register_headers,
         data=BmwNoiNoiBmvYasYas(G, F, payload),
@@ -1151,7 +1221,7 @@ def create_guest_account_with_proxy(region, account_name, password_prefix, is_gh
         "X-Unity-Version": "2018.4.11f1",
         "Host": login_url.split('/')[2],
     }, region)
-    login_response = http_session.post(
+    login_response = session.post(
         login_url,
         headers=major_login_headers,
         data=BmwNoiNoiBmvYasYas(G, F, req_msg.SerializeToString()),
@@ -1896,6 +1966,8 @@ def create_account_api():
         is_ghost = region.upper() == "GHOST"
         password_prefix = f"{account_name}_{region}".upper()
         result = create_guest_account(region, account_name, password_prefix, is_ghost)
+        if result.get("rate_limited"):
+            return jsonify(result), 429
         return jsonify(result), 200 if result.get("guest_created") else 502
     except requests.HTTPError as e:
         status_code = e.response.status_code if e.response is not None else 502
