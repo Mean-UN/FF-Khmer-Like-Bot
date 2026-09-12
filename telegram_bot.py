@@ -11,6 +11,7 @@ import time
 from html import escape
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from reseller_bot import ResellerFeatures
 
 import requests
 import telebot
@@ -51,6 +52,7 @@ CAMBODIA_TZ = timezone(timedelta(hours=7), "ICT")
 DAILY_RESET_HOUR = 5
 DAILY_RESET_MINUTE = 30
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+resellers = ResellerFeatures(sys.modules[__name__])
 UIDPASS_FILE_SETS = {
     "like": ("uidpass.json", "tokens.json"),
     "likeff": ("uidpass_likeff.json", "tokens_likeff.json"),
@@ -1079,7 +1081,8 @@ def autolike_label(kind="likeff"):
 
 
 def load_autolike_orders(kind="likeff"):
-    return read_json_file(autolike_orders_file(kind), [])
+    orders = read_json_file(autolike_orders_file(kind), [])
+    return resellers.reconcile_orders(orders) if kind == "likeff" else orders
 
 
 def save_autolike_orders(orders, kind="likeff"):
@@ -1433,6 +1436,15 @@ def format_autolike_delivery(order, data, likes_sent, private=False):
 
 
 def notify_autolike_order(order, group_text, private_text=None):
+    if order.get("seller_event_id"):
+        resellers.store.record_order(order)
+        active_bot = bot
+        if user_bot and order.get("notification_bot_id") == user_bot.token.split(":")[0]:
+            active_bot = user_bot
+        try:
+            active_bot.send_message(int(order["telegram_user_id"]), private_text or group_text, parse_mode=None)
+        except Exception as exc:
+            logger.warning("Reseller delivery notification failed: %s", exc)
     group_id = order.get("group_id")
     if group_id:
         try:
@@ -1495,7 +1507,7 @@ def deliver_autolike_order(order, kind="likeff", period=None, schedule_next=True
 
     if not data.get("success") or data.get("error"):
         raw_error = data.get("error") or "LikeFF request failed"
-        order["last_error"] = "This region is not support"
+        order["last_error"] = str(raw_error)
         if notify_failure:
             region = data.get("Region") or order.get("region") or infer_region_from_error(raw_error)
             notify_autolike_order(
@@ -1546,19 +1558,54 @@ def deliver_autolikeff_order(order, period=None, schedule_next=True, notify_fail
     return deliver_autolike_order(order, "likeff", period, schedule_next, notify_failure)
 
 
-def deliver_autolike_order_now(order_id, kind="likeff"):
+def deliver_autolike_order_now(order_id, kind="likeff", period=None, expected_order=None):
+    scheduled = period is not None
+    period = period or current_autolike_period()
     with autolike_lock:
         orders = load_autolike_orders(kind)
-    target_order = None
-    for order in orders:
-        if str(order.get("order_id")) == str(order_id):
-            target_order = order
-            break
-    if not target_order:
-        return
-    deliver_autolike_order(target_order, kind, period=current_autolike_period(), schedule_next=True)
-    with autolike_lock:
-        merge_save_autolike_orders([target_order], kind)
+        target_order = next((order for order in orders if str(order.get("order_id")) == str(order_id)), None)
+        if not target_order or target_order.get("status") != "active":
+            return False
+        identity_fields = ("uid", "created_at", "seller_event_id")
+        if expected_order and any(target_order.get(key) != expected_order.get(key) for key in identity_fields):
+            return False
+        if target_order.get("last_attempt_period") == period or target_order.get("last_period") == period:
+            return False
+        if scheduled and (target_order.get("next_run_date") or period) > period:
+            return False
+        # Persist the claim before calling the API so the immediate-delivery
+        # thread and scheduled worker cannot submit the same order together.
+        target_order["last_attempt_period"] = period
+        save_autolike_orders(orders, kind)
+    try:
+        deliver_autolike_order(target_order, kind, period=period, schedule_next=True)
+    finally:
+        with autolike_lock:
+            current = load_autolike_orders(kind)
+            for index, order in enumerate(current):
+                if str(order.get("order_id")) != str(order_id):
+                    continue
+                if any(order.get(key) != target_order.get(key) for key in identity_fields):
+                    break
+                if order.get("status") == "cancelled":
+                    break
+                # Preserve owner extensions made while the request was running.
+                target_order["total_likes"] = order["total_likes"]
+                for field in ("seller_extensions", "extended_at"):
+                    if field in order:
+                        target_order[field] = order[field]
+                if autolike_order_status(target_order)[2] > 0:
+                    target_order.pop("remove_after_save", None)
+                    target_order["status"] = "active"
+                if target_order.get("remove_after_save"):
+                    current.pop(index)
+                else:
+                    current[index] = target_order
+                save_autolike_orders(current, kind)
+                if target_order.get("seller_event_id"):
+                    resellers.store.record_order(target_order)
+                break
+    return True
 
 
 def deliver_autolikeff_order_now(order_id):
@@ -1923,6 +1970,9 @@ def build_help_text(chat_id=None, user_id=None, active_bot=None, page="main"):
             "━━━━━━━━━━━━━━━━━━",
             "❤️ /like <uid> - Send likes to a player",
             "💎 /likeff <uid> - Send premium like",
+            "🧾 /seller - Reseller daily usage and bill",
+            "🔁 /autolikeff <uid> <package_likes> - Reseller AutoLikeFF order",
+            "➕ /extend <uid> <package_likes> - Extend your AutoLikeFF order",
             "👤 /ffinfo <uid> - View full player profile",
             "📊 /level <uid> - Check level EXP progress",
             "🌍 /region <uid> - Check player region",
@@ -2005,6 +2055,12 @@ def build_help_text(chat_id=None, user_id=None, active_bot=None, page="main"):
             "📦 /uidpassff 1 add <uid> <password> - Add account to slot",
             "📥 /uidpassff 1 bulk - Reply to JSON to import accounts",
             "⏳ /remain - Check daily request usage",
+            "📊 /slotusage [1-30] - Check daily LikeFF slot requests",
+            "👥 /seller <telegram_id> <requests> - Add reseller requests",
+            "🧾 /seller summary [YYYY-MM-DD] - Daily reseller bills",
+            "📜 /seller history <telegram_id> [page] - Reseller history",
+            "✅ /seller paid <telegram_id> <YYYY-MM-DD> - Record payment",
+            "⛔ /seller disable <telegram_id> - Disable new purchases",
             "",
             "👑 OWNER INFO",
             "━━━━━━━━━━━━━━━━━━",
@@ -2025,13 +2081,17 @@ def build_help_text(chat_id=None, user_id=None, active_bot=None, page="main"):
 def process_like(message, endpoint, uid, region=None, active_bot=None):
     active_bot = active_bot or active_bot_for(message)
     user_id = message.from_user.id
+    reseller_request = endpoint == "likeff" and not is_owner(user_id)
+    if reseller_request and not resellers.allowed(user_id):
+        active_bot.reply_to(message, "⛔ Reseller access is disabled.", parse_mode=None)
+        return
     now = datetime.now(CAMBODIA_TZ)
     usage = usage_tracker.get(user_id, {"used": 0, "last_used": now - timedelta(days=1)})
     if usage_reset_period(now) > usage_reset_period(usage["last_used"]):
         usage["used"] = 0
 
     limit = get_user_limit(user_id)
-    if usage["used"] >= limit:
+    if not reseller_request and usage["used"] >= limit:
         active_bot.reply_to(message, "⛔ Daily request limit reached.\n━━━━━━━━━━━━━━━━━━\n📌 Please try again tomorrow.", parse_mode=None)
         return
 
@@ -2053,10 +2113,10 @@ def process_like(message, endpoint, uid, region=None, active_bot=None):
     params = {"uid": uid}
     if resolved_region:
         params["region"] = resolved_region
-    data = call_api(endpoint, params)
+    data = resellers.manual_call(message, params) if reseller_request else call_api(endpoint, params)
     if not data.get("success") or "error" in data:
         error_text = str(data.get("error") or "Request failed")
-        if (
+        if not reseller_request and (
             "Client error" in error_text
             or "Bad Request" in error_text
             or "GetPlayerPersonalShow" in error_text
@@ -2064,7 +2124,7 @@ def process_like(message, endpoint, uid, region=None, active_bot=None):
             or "UID not found" in error_text
         ):
             error_text = "User not found or region is incorrect."
-        elif "timeout" in error_text.lower() or "timed out" in error_text.lower():
+        elif not reseller_request and ("timeout" in error_text.lower() or "timed out" in error_text.lower()):
             error_text = "Request timeout. Please try again later."
         active_bot.edit_message_text(
             chat_id=status_msg.chat.id,
@@ -2093,9 +2153,10 @@ def process_like(message, endpoint, uid, region=None, active_bot=None):
 
     response_uid = data.get("UID") or uid
     remember_like_success(response_uid, now)
-    usage["used"] += 1
-    usage["last_used"] = now
-    usage_tracker[user_id] = usage
+    if not reseller_request:
+        usage["used"] += 1
+        usage["last_used"] = now
+        usage_tracker[user_id] = usage
 
     owner_contact = owner_contact_text()
     text = "\n".join([
@@ -2107,7 +2168,7 @@ def process_like(message, endpoint, uid, region=None, active_bot=None):
         f"👍 Likes Before: {data.get('LikesbeforeCommand', 'N/A')}",
         f"➕ Likes Added: {likes_added}",
         f"❤️ Total Now: {data.get('LikesafterCommand', 'N/A')}",
-        f"📌 Requests Left: {'∞' if limit >= 999999 else limit - usage['used']}",
+        f"📌 Requests Left: {data['seller_requests'].removesuffix(' left') if reseller_request else ('∞' if limit >= 999999 else limit - usage['used'])}",
         "━━━━━━━━━━━━━━━━━━",
         "💥 Daily 220 Likes!",
         f"🚀 Contact {owner_contact} to purchase Likes.",
@@ -2117,7 +2178,8 @@ def process_like(message, endpoint, uid, region=None, active_bot=None):
 
 def handle_like_command(message, endpoint, active_bot=None):
     active_bot = active_bot or active_bot_for(message)
-    if not check_access(message, active_bot=active_bot):
+    seller_access = endpoint == "likeff" and resellers.allowed(message.from_user.id)
+    if not seller_access and not check_access(message, active_bot=active_bot):
         return
     args = message.text.split()
     usage = "\n".join([
@@ -2943,7 +3005,7 @@ def likeff_command(message):
     active_bot = active_bot_for(message)
     if command_belongs_to_other_bot(message, active_bot):
         return
-    if not OWNER_ID or message.from_user.id != OWNER_ID:
+    if not is_owner(message.from_user.id) and not resellers.allowed(message.from_user.id):
         active_bot.reply_to(message, format_likeff_price_list(), parse_mode=None)
         return
     handle_like_command(message, "likeff", active_bot=active_bot)
@@ -3007,7 +3069,21 @@ def autolikegroup_command(message):
 
 @bot.message_handler(commands=["autolikeff"])
 def autolikeff_command(message):
+    active_bot = active_bot_for(message)
+    if command_belongs_to_other_bot(message, active_bot):
+        return
+    if not is_owner(message.from_user.id):
+        if resellers.allowed(message.from_user.id):
+            resellers.create_order(message)
+        else:
+            active_bot.reply_to(message, "⛔ Reseller access required.", parse_mode=None)
+        return
     handle_autolike_owner_command(message, "likeff")
+
+
+@bot.message_handler(commands=["seller"])
+def seller_command(message):
+    resellers.command(message)
 
 
 @bot.message_handler(commands=["autolike"])
@@ -3129,12 +3205,19 @@ def handle_autolike_owner_command(message, kind="likeff"):
         "⏳ First delivery is processing now.",
     ])
     bot.reply_to(message, text, parse_mode="HTML")
-    threading.Thread(target=deliver_autolike_order_now, args=(order["order_id"], kind), daemon=True).start()
+    threading.Thread(target=deliver_autolike_order_now, args=(order["order_id"], kind), kwargs={"expected_order": dict(order)}, daemon=True).start()
 
 
 @bot.message_handler(commands=["extend"])
 def extend_autolikeff_command(message):
+    active_bot = active_bot_for(message)
+    if command_belongs_to_other_bot(message, active_bot):
+        return
     if not is_owner(message.from_user.id):
+        if resellers.allowed(message.from_user.id):
+            resellers.extend_order(message)
+        else:
+            active_bot.reply_to(message, "⛔ Reseller access required.", parse_mode=None)
         return
     parts = message.text.split()
     if len(parts) != 3 or not parts[1].isdigit() or not parts[2].isdigit():
@@ -3477,6 +3560,48 @@ def process_region_check(message, uid, active_bot=None):
         text=format_region_info(data, requested_by),
         parse_mode="HTML",
     )
+
+
+@bot.message_handler(commands=["slotusage"])
+def slotusage_command(message):
+    active_bot = active_bot_for(message)
+    if command_belongs_to_other_bot(message, active_bot):
+        return
+    if OWNER_ID and message.from_user.id != OWNER_ID:
+        return
+    args = message.text.split()
+    if len(args) > 2 or (len(args) == 2 and (
+        not args[1].isascii() or not args[1].isdigit() or not 1 <= int(args[1]) <= 30
+    )):
+        active_bot.reply_to(message, "Use: /slotusage or /slotusage <1-30>", parse_mode=None)
+        return
+    params = {"slot": int(args[1])} if len(args) == 2 else {}
+    data = call_api("usage", params, timeout=40)
+    if not isinstance(data, dict) or "error" in data:
+        error = data.get("error", "Invalid API response") if isinstance(data, dict) else "Invalid API response"
+        active_bot.reply_to(message, f"Could not load slot usage: {error}", parse_mode=None)
+        return
+    slots = [data] if params else data.get("slots")
+    if not isinstance(slots, list) or not slots or any(
+        not isinstance(item, dict) or any(
+            not isinstance(item.get(key), int) for key in ("slot", "used", "max_limit", "remaining")
+        ) for item in slots
+    ):
+        active_bot.reply_to(message, "Slot usage is unavailable. Deploy the updated API and request_usage.py, then restart the API.", parse_mode=None)
+        return
+    lines = [
+        "📊 LIKEFF DAILY SLOT USAGE",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"📅 {data.get('date', 'N/A')}",
+        "🔄 Reset: 03:00 Cambodia",
+        "",
+    ]
+    for item in slots:
+        icon = "🔴" if item['used'] >= item['max_limit'] else "🟢"
+        lines.append(f"{icon} Slot {item['slot']:02d}  •  {item['used']}/{item['max_limit']}")
+    if len(slots) > 1:
+        lines.extend(["", "━━━━━━━━━━━━━━━━━━━━", f"📈 Total: {sum(s['used'] for s in slots)}/{sum(s['max_limit'] for s in slots)}"])
+    active_bot.reply_to(message, "\n".join(lines), parse_mode=None)
 
 
 @bot.message_handler(commands=["remain"])
@@ -4776,14 +4901,12 @@ def process_autolike_orders(kind="likeff"):
             with autolike_lock:
                 orders = load_autolike_orders(kind)
 
-            changed = False
             for order in orders:
                 if order.get("status") != "active":
                     continue
                 sent, total, remaining = autolike_order_status(order)
                 if remaining <= 0:
-                    order["status"] = "completed"
-                    changed = True
+                    deliver_autolike_order_now(order["order_id"], kind, period=period, expected_order=order)
                     continue
                 next_run_date = order.get("next_run_date") or period
                 if next_run_date > period:
@@ -4791,13 +4914,8 @@ def process_autolike_orders(kind="likeff"):
                 if order.get("last_attempt_period") == period or order.get("last_period") == period:
                     continue
 
-                deliver_autolike_order(order, kind, period=period, schedule_next=True)
-                changed = True
-                time.sleep(AUTOLIKEFF_ORDER_DELAY)
-
-            if changed:
-                with autolike_lock:
-                    merge_save_autolike_orders(orders, kind)
+                if deliver_autolike_order_now(order["order_id"], kind, period=period, expected_order=order):
+                    time.sleep(AUTOLIKEFF_ORDER_DELAY)
         except Exception:
             logger.exception("%s worker failed", autolike_label(kind))
         time.sleep(AUTOLIKEFF_CHECK_INTERVAL)
@@ -4843,7 +4961,6 @@ def process_autolikeff_near_end_notices():
             with autolike_lock:
                 orders = load_autolike_orders()
 
-            changed = False
             for order in orders:
                 if order.get("status") != "active":
                     continue
@@ -4856,15 +4973,20 @@ def process_autolikeff_near_end_notices():
                 if not user_id:
                     continue
                 try:
-                    bot.send_message(int(user_id), format_autolike_near_end_notice(order), parse_mode=None)
-                    order["last_near_end_notice_period"] = period
-                    changed = True
+                    active_bot = bot
+                    if user_bot and order.get("notification_bot_id") == user_bot.token.split(":")[0]:
+                        active_bot = user_bot
+                    active_bot.send_message(int(user_id), format_autolike_near_end_notice(order), parse_mode=None)
+                    with autolike_lock:
+                        current = load_autolike_orders()
+                        for saved_order in current:
+                            if all(saved_order.get(key) == order.get(key) for key in ("order_id", "uid", "created_at", "seller_event_id")):
+                                saved_order["last_near_end_notice_period"] = period
+                                save_autolike_orders(current)
+                                break
                 except Exception as exc:
                     logger.warning("AutoLikeFF near-end notice failed for %s: %s", user_id, exc)
 
-            if changed:
-                with autolike_lock:
-                    merge_save_autolike_orders(orders)
         except Exception:
             logger.exception("AutoLikeFF near-end notice worker failed")
         time.sleep(AUTOLIKEFF_CHECK_INTERVAL)
@@ -4926,6 +5048,10 @@ def register_user_bot_handlers():
         (["region"], region_command),
         (["myautolike"], myautolike_command),
         (["bio"], bio_command),
+        (["slotusage"], slotusage_command),
+        (["seller"], seller_command),
+        (["autolikeff"], autolikeff_command),
+        (["extend"], extend_autolikeff_command),
     ]:
         user_bot.message_handler(commands=commands)(bind_handler_to_bot(handler, user_bot))
     user_bot.callback_query_handler(func=lambda call: call.data == "verify_join")(bind_handler_to_bot(verify_join_callback, user_bot))

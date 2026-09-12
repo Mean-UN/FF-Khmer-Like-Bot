@@ -28,6 +28,10 @@ telegram_users.json
 regions.json
 likeff_slot_usage.json
 likeff_slot_accounts.json
+request_usage.sqlite3
+request_usage.sqlite3-*
+resellers.sqlite3
+resellers.sqlite3-*
 Guest-*.json
 
 # Logs and temporary files

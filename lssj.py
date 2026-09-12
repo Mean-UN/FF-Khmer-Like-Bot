@@ -18,6 +18,7 @@ from collections import defaultdict
 from functools import wraps
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from request_usage import install_request_usage
 from datetime import datetime, timezone, timedelta
 from typing import Tuple
 from proto import FreeFire_pb2, main_pb2, AccountPersonalShow_pb2, MajorLoginReq_pb2, MajorLoginRes_pb2, like_pb2, like_count_pb2
@@ -38,6 +39,7 @@ REGNS = {"IND", "BR", "US", "SAC", "NA", "SG", "RU", "ID", "TW", "VN", "TH", "ME
 FAHHHH = Flask(__name__)
 CORS(FAHHHH)
 app = FAHHHH
+install_request_usage(FAHHHH)
 if hasattr(FAHHHH, "json"):
     FAHHHH.json.sort_keys = False
 else:
@@ -706,6 +708,11 @@ def load_like_tokens(region=None, token_file=LIKE_TOKEN_FILE, slot=None):
                     return tokens
             except Exception:
                 continue
+
+        # A shared flat token list is the legacy first slot only. Reusing it
+        # for every missing slot would multiply the same accounts' quota.
+        if int(slot) != 1:
+            return []
 
     return token_items_to_bearers(items, region)
 
@@ -1400,6 +1407,7 @@ def index():
         "status": "ok",
         "message": "Info API is running.",
         "endpoints": {
+            "usage": "/usage",
             "jwt": "/jwt?uid=xxx&pw=xxx",
             "access_token": "/access-token?uid=xxx&password=xxx",
             "like": "/like?uid=xxx",
@@ -1420,6 +1428,7 @@ def not_found(_):
         "message": "Route not found.",
         "available_endpoints": [
             "/",
+            "/usage",
             "/jwt",
             "/access-token",
             "/like",
@@ -1582,13 +1591,21 @@ def run_like_api(token_file, endpoint_name, auto_slot=False):
     if region not in REGNS:
         return jsonify({"success": False, "error": f"Unsupported region: {region}"}), 400
 
+    reservation = None
+    tracker = FAHHHH.extensions["slot_usage"]
     try:
         slot = None
         slot_new = False
         if auto_slot:
-            slot, slot_new = assign_likeff_slot(uid)
+            configured_tokens = {
+                candidate: load_like_tokens(token_file=token_file, slot=candidate)
+                for candidate in range(1, LIKEFF_SLOT_COUNT + 1)
+            }
+            reservation = tracker.reserve([candidate for candidate, tokens in configured_tokens.items() if tokens])
+            slot = reservation[2]
+            slot_new = True
 
-        like_tokens = load_like_tokens(token_file=token_file, slot=slot)
+        like_tokens = configured_tokens[slot] if auto_slot else load_like_tokens(token_file=token_file, slot=slot)
         if not like_tokens:
             slot_msg = f" for slot {slot}" if slot else ""
             return jsonify({"success": False, "error": f"No {endpoint_name} tokens configured{slot_msg}"}), 503
@@ -1619,16 +1636,18 @@ def run_like_api(token_file, endpoint_name, auto_slot=False):
         }
 
         if auto_slot and slot:
-            usage = current_likeff_slot_usage()
-            slot_count = sum(
-                1 for assigned_slot in usage.get("assignments", {}).values()
-                if str(assigned_slot) == str(slot)
-            )
-            payload["slot_usage"] = f"{slot_count}/{LIKEFF_UIDS_PER_SLOT}"
+            usage = tracker.finish(reservation, likes_given)
+            reservation = None
+            payload["usage"] = usage
+            payload["slot_usage"] = f"{usage['used']}/{usage['max_limit']}"
 
         return jsonify(payload), 200
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        return jsonify({"success": False, "error": str(e), "slot": slot}), 500
+
+    finally:
+        if reservation is not None:
+            tracker.finish(reservation, 0)
 
 @FAHHHH.route('/like', methods=['GET'])
 def like_api():
