@@ -16,6 +16,14 @@ from reseller_bot import ResellerFeatures
 from reseller_store import ICT, ResellerStore, SellerError
 
 
+class TestKeyboard:
+    def __init__(self, **kwargs):
+        self.keyboard = []
+
+    def row(self, *buttons):
+        self.keyboard.append(list(buttons))
+
+
 class ResellerTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -154,18 +162,21 @@ class ResellerBotTests(unittest.TestCase):
         self.messages = []
         self.orders = []
         self.core = SimpleNamespace(
-            BASE_DIR=self.temp.name, bot=self.bot, user_bot=None,
+            BASE_DIR=self.temp.name, bot=self.bot, user_bot=None, OWNER_ID=1,
             active_bot_for=lambda message: self.bot,
             command_belongs_to_other_bot=lambda *args: False,
             is_owner=lambda uid: uid == 1,
             requester_name=lambda u: " ".join(v for v in [u.first_name, u.last_name] if v),
             send_long_message=lambda message, text, **kw: self.messages.append(text),
             telegram_user_record=lambda uid: {"name": "Dara Sok", "username": "dara"},
+            resolve_autolike_group_id=lambda message: str(message.chat.id) if message.chat.type in ("group", "supergroup") else "",
             autolike_lock=threading.Lock(),
             find_existing_autolike_order=lambda orders, uid: next((o for o in orders if o["uid"] == uid), None),
             next_autolike_order_id=lambda orders: str(len(orders) + 1),
             next_autolike_run_date=lambda **kw: "2026-09-14",
             deliver_autolike_order_now=Mock(), logger=Mock(),
+            InlineKeyboardMarkup=TestKeyboard,
+            InlineKeyboardButton=lambda text, callback_data: SimpleNamespace(text=text, callback_data=callback_data),
             format_autolike_order=Mock(return_value="Order extended"),
             call_api=Mock(return_value={"success": True, "LikesGivenByAPI": 220, "UID": 123}),
         )
@@ -195,12 +206,63 @@ class ResellerBotTests(unittest.TestCase):
         self.features.manual_call(self.message, {"uid": "123"})
         self.assertEqual(self.features.store.report(7)[0]["used"], 2)
 
+    def test_owner_alert_only_for_successful_manual_requests(self):
+        self.features.manual_call(self.message, {"uid": "123"})
+        self.features.manual_call(self.message, {"uid": "123"})
+        self.message.message_id = 2
+        self.core.call_api.return_value = {"success": True, "LikesGivenByAPI": 0}
+        self.features.manual_call(self.message, {"uid": "123"})
+        self.message.message_id = 3
+        self.core.call_api.return_value = {"success": False, "error": "API timeout"}
+        self.features.manual_call(self.message, {"uid": "123"})
+        self.features.send_owner_alerts()
+        self.bot.send_message.assert_called_once()
+        args = self.bot.send_message.call_args.args
+        self.assertEqual(args[0], 1)
+        self.assertIn("Dara Sok", args[1])
+        self.assertIn("Likes sent: 220", args[1])
+        self.assertIn("Charge: $0.20", args[1])
+        self.features.send_owner_alerts()
+        self.bot.send_message.assert_called_once()
+
+    def test_owner_alerts_for_order_and_extension_not_each_delivery(self):
+        self.message.text = "/autolikeff 123 1000"
+        with patch("reseller_bot.threading.Thread"):
+            self.features.create_order(self.message)
+        self.message.message_id = 2
+        self.message.text = "/extend 123 2000"
+        self.features.extend_order(self.message)
+        self.orders[0]["sent_likes"] = 220
+        self.features.store.record_order(self.orders[0])
+        self.features.send_owner_alerts()
+        self.assertEqual(self.bot.send_message.call_count, 2)
+        texts = [call.args[1] for call in self.bot.send_message.call_args_list]
+        self.assertTrue(any("AUTOLIKEFF ORDER" in text and "Charge: $0.50" in text for text in texts))
+        self.assertTrue(any("AUTOLIKEFF EXTENSION" in text and "Charge: $1.00" in text for text in texts))
+        self.orders[0]["sent_likes"] = 440
+        self.features.store.record_order(self.orders[0])
+        self.features.send_owner_alerts()
+        self.assertEqual(self.bot.send_message.call_count, 2)
+
+    def test_owner_alert_failure_retries_after_restart_without_recharging(self):
+        self.features.manual_call(self.message, {"uid": "123"})
+        self.bot.send_message.side_effect = RuntimeError("Telegram unavailable")
+        self.features.send_owner_alerts()
+        self.assertEqual(len(self.features.store.pending_owner_alerts()), 1)
+        restarted = ResellerFeatures(self.core)
+        self.bot.send_message.side_effect = None
+        restarted.send_owner_alerts()
+        self.assertEqual(restarted.store.pending_owner_alerts(), [])
+        self.assertEqual(restarted.store.report(7)[0]["used"], 1)
+        self.assertEqual(restarted.store.report(7)[0]["cents"], 20)
+
     def test_order_uses_senders_id_charges_once_and_preserves_history(self):
         self.message.text = "/autolikeff 123 10000"
         with patch("reseller_bot.threading.Thread") as thread:
             self.features.create_order(self.message)
             thread.return_value.start.assert_called_once()
         self.assertEqual(self.orders[0]["telegram_user_id"], "7")
+        self.assertEqual(self.orders[0]["group_id"], "")
         self.assertEqual(self.orders[0]["telegram_user_name"], "Dara Sok")
         self.assertEqual(self.features.store.report(7)[0]["cents"], 450)
         self.assertIn("Total Likes: 10,000", self.messages[-1])
@@ -216,6 +278,37 @@ class ResellerBotTests(unittest.TestCase):
         self.assertEqual(self.features.reconcile_orders([]), [])
         history = self.features.store.history(7)
         self.assertEqual((history[0]["likes"], history[0]["cents"]), (10000, 450))
+
+    def test_group_order_sends_result_using_originating_bot(self):
+        self.message.chat.type = "supergroup"
+        self.message.chat.id = -100123
+        self.message.text = "/autolikeff 123 1000"
+        with patch("reseller_bot.threading.Thread"):
+            self.features.create_order(self.message)
+        self.assertEqual(self.orders[0]["group_id"], "-100123")
+        tree = ast.parse(Path("telegram_bot.py").read_text(encoding="utf-8-sig"))
+        node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "notify_autolike_order")
+        primary = Mock(token="other:fake")
+        ns = dict(bot=primary, user_bot=self.bot, resellers=self.features, logger=Mock())
+        exec(compile(ast.Module(body=[node], type_ignores=[]), "telegram_bot.py", "exec"), ns)
+        # A blocked private chat must not prevent the group result.
+        self.bot.send_message.side_effect = [RuntimeError("private chat blocked"), None]
+        ns["notify_autolike_order"](self.orders[0], "Group result", "Private result")
+        self.bot.send_message.assert_any_call(7, "Private result", parse_mode=None)
+        self.bot.send_message.assert_any_call(-100123, "Group result", parse_mode=None)
+        primary.send_message.assert_not_called()
+
+    def test_private_reseller_order_uses_assigned_group(self):
+        tree = ast.parse(Path("telegram_bot.py").read_text(encoding="utf-8-sig"))
+        node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "resolve_autolike_group_id")
+        ns = {"load_autolike_groups": lambda: ["-100999"]}
+        exec(compile(ast.Module(body=[node], type_ignores=[]), "telegram_bot.py", "exec"), ns)
+        self.core.resolve_autolike_group_id = ns["resolve_autolike_group_id"]
+        self.message.text = "/autolikeff 123 1000"
+        with patch("reseller_bot.threading.Thread"):
+            self.features.create_order(self.message)
+        self.assertEqual(self.orders[0]["group_id"], "-100999")
+        self.assertEqual(self.orders[0]["telegram_user_id"], "7")
 
     def test_outbox_recovers_failed_export(self):
         self.message.text = "/autolikeff 123 1000"
@@ -379,6 +472,7 @@ class ResellerBotTests(unittest.TestCase):
             self.message.message_id = number
             namespace["process_like"](self.message, "likeff", "123", active_bot=self.bot)
         self.assertEqual(self.features.store.report(7)[0]["used"], 3)
+
         self.assertEqual(namespace["usage_tracker"], {})
         text = self.bot.edit_message_text.call_args.kwargs["text"]
         self.assertIn("Like Request Processed Successfully", text)
@@ -392,6 +486,372 @@ class ResellerBotTests(unittest.TestCase):
         self.assertIn("Already Received Maximum Free Likes", text)
         self.assertNotIn("Charged:", text)
         self.assertEqual(self.features.store.report(7)[0]["used"], 3)
+
+    def test_history_buttons_layout_and_page_boundaries(self):
+        for i in range(15):
+            key = f"history-{i}"
+            self.features.store.reserve(7, key, "likeff", str(100 + i))
+            self.features.store.finish_manual(key, 0)
+        self.message.text = "/seller history"
+        self.features.command(self.message)
+        first = self.bot.reply_to.call_args
+        text = first.args[1]
+        self.assertEqual(text.count("👤 Dara Sok"), 1)
+        self.assertIn("🆔 7", text)
+        self.assertEqual(text.count("LIKEFF · UID"), 7)
+        self.assertNotIn("Page", text)
+        self.assertNotIn("next page number", text)
+        buttons = first.kwargs["reply_markup"].keyboard[0]
+        self.assertEqual([b.text for b in buttons], ["1 / 3", "Next ➡️"])
+        self.assertEqual(buttons[-1].callback_data, "sellerhist:7:2")
+
+        call = SimpleNamespace(id="tap", data="sellerhist:7:2", from_user=self.message.from_user, message=self.message)
+        self.features.history_callback(call)
+        edit = self.bot.edit_message_text.call_args.kwargs
+        self.assertEqual(edit["message_id"], self.message.message_id)
+        self.assertEqual(edit["text"].count("LIKEFF · UID"), 7)
+        self.assertEqual([b.text for b in edit["reply_markup"].keyboard[0]], ["⬅️ Previous", "2 / 3", "Next ➡️"])
+        self.assertNotIn("UID 114", edit["text"])
+        call.data = "sellerhist:7:999999999999999999999999"
+        self.features.history_callback(call)
+        edit = self.bot.edit_message_text.call_args.kwargs
+        self.assertEqual(edit["text"].count("LIKEFF · UID"), 1)
+        self.assertEqual([b.text for b in edit["reply_markup"].keyboard[0]], ["⬅️ Previous", "3 / 3"])
+        self.assertLess(len(edit["text"].encode("utf-16-le")) // 2, 4096)
+
+    def test_history_callback_access_and_empty_history(self):
+        call = SimpleNamespace(id="tap", data="sellerhist:8:1", from_user=self.message.from_user, message=self.message)
+        self.features.history_callback(call)
+        self.bot.edit_message_text.assert_not_called()
+        self.assertTrue(self.bot.answer_callback_query.call_args.kwargs["show_alert"])
+        call.from_user = SimpleNamespace(id=1)
+        self.features.history_callback(call)
+        self.assertIn("No history yet.", self.bot.edit_message_text.call_args.kwargs["text"])
+        self.assertIsNone(self.bot.edit_message_text.call_args.kwargs["reply_markup"])
+        call.data = "sellerhist:7:bad"
+        self.bot.edit_message_text.reset_mock()
+        self.features.history_callback(call)
+        self.bot.edit_message_text.assert_not_called()
+
+
+
+class DailyBillTests(unittest.TestCase):
+    def setUp(self):
+        ResellerBotTests.setUp(self)
+        self.now = datetime(2026, 9, 13, 12, tzinfo=ICT)
+        self.features.store.now = lambda: self.now
+        self.bot.send_message.return_value = SimpleNamespace(message_id=500)
+        self.features.send_daily_bills()
+
+    def purchase(self, key="purchase", package=1000):
+        self.features.store.reserve(7, key, "autolikeff", "123", package, {})
+
+    def partial_command(self, amount="0.20", message_id=500):
+        self.message.from_user.id = 1
+        self.message.chat.id = 1
+        self.message.message_id = message_id
+        self.message.text = f"/seller paid 7 {amount}"
+        self.bot.send_message.return_value = SimpleNamespace(message_id=message_id)
+        self.features.command(self.message)
+        data = self.bot.send_message.call_args.kwargs["reply_markup"].keyboard[0][0].callback_data
+        call = self.bill_call(data)
+        call.message.message_id = message_id
+        return call
+
+    def test_partial_payment_confirmation_replay_and_audit(self):
+        self.purchase()
+        call = self.partial_command()
+        self.assertEqual(self.features.store.report(7)[0]["paid"], 0)
+        self.features.bill_callback(call)
+        self.features.bill_callback(call)
+        report = self.features.store.report(7)[0]
+        self.assertEqual((report["paid"], report["cents"] - report["paid"]), (20, 30))
+        entries = self.features.store.payment_history(7)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual((entries[0]["before_cents"], entries[0]["after_cents"], entries[0]["actor_id"]), (0, 20, "1"))
+        self.features.store = ResellerStore(self.features.store.path)
+        self.features.store.now = lambda: self.now
+        self.features.bill_callback(call)
+        self.assertEqual(self.features.store.report(7)[0]["paid"], 20)
+        second = self.partial_command("0.30", 501)
+        self.features.bill_callback(second)
+        self.assertEqual(self.features.store.report(7)[0]["paid"], 50)
+        self.assertEqual(len(self.features.store.payment_history(7)), 2)
+
+    def test_partial_stale_confirmation_and_pending_audit(self):
+        self.purchase()
+        first = self.partial_command("0.20", 500)
+        second = self.partial_command("0.30", 501)
+        self.features.bill_callback(first)
+        self.assertNotIn(501, [c.kwargs["message_id"] for c in self.bot.edit_message_text.call_args_list])
+        self.features.bill_callback(second)
+        self.assertEqual(self.features.store.report(7)[0]["paid"], 20)
+        pending = self.bill_call(first.data.rsplit(":", 1)[0] + ":pending")
+        self.features.bill_callback(pending)
+        self.assertEqual(self.features.store.report(7)[0]["paid"], 0)
+        history = self.features.store.payment_history(7)
+        self.assertEqual((history[0]["action"], history[0]["before_cents"], history[0]["after_cents"]), ("pending", 20, 0))
+
+    def test_invalid_partial_amounts_and_owner_only_history(self):
+        self.purchase()
+        self.message.from_user.id = 1
+        for amount in ("0", "-1", "0.001", "nan", "1e2", "0.51"):
+            self.message.text = f"/seller paid 7 {amount}"
+            self.features.command(self.message)
+        self.bot.send_message.assert_not_called()
+        self.message.from_user.id = 7
+        self.message.text = "/seller payments 7"
+        self.features.command(self.message)
+        self.assertNotIn("RESELLER PAYMENT HISTORY", self.messages[-1])
+
+    def test_partial_old_date_and_history_output(self):
+        self.purchase()
+        self.now += timedelta(days=1)
+        call = self.partial_command("0.20 2026-09-13")
+        self.features.bill_callback(call)
+        self.assertEqual(self.features.store.report(7, "2026-09-13")[0]["paid"], 20)
+        self.assertEqual(self.features.store.report(7)[0]["paid"], 0)
+        self.message.text = "/seller payments 7"
+        self.features.command(self.message)
+        self.assertIn("PARTIAL", self.messages[-1])
+        self.assertIn("$0.00 → $0.20", self.messages[-1])
+
+    def test_concurrent_partial_confirmation_only_adds_once(self):
+        self.purchase()
+        call = self.partial_command()
+        _, bill_id, status = call.data.split(":")
+        def confirm():
+            try:
+                self.features.store.set_bill_status(int(bill_id), status, 1, 500, 1)
+                return True
+            except SellerError:
+                return False
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(lambda _: confirm(), range(2)))
+        self.assertEqual(sum(results), 1)
+        self.assertEqual(self.features.store.report(7)[0]["paid"], 20)
+        self.assertEqual(len(self.features.store.payment_history(7)), 1)
+
+    def test_full_payment_and_pending_history_survive_later_charges(self):
+        self.purchase()
+        bill = self.features.store.manual_bill(7)
+        self.features.store.manual_bill_sent(bill["bill_id"], 1, 500)
+        self.features.bill_callback(self.bill_call(f"sellerbill:{bill['bill_id']}:paid"))
+        self.features.bill_callback(self.bill_call(f"sellerbill:{bill['bill_id']}:pending"))
+        entries = self.features.store.payment_history(7)
+        self.assertEqual([(e["action"], e["before_cents"], e["after_cents"]) for e in entries], [("pending", 50, 0), ("paid", 0, 50)])
+        call = self.partial_command()
+        self.purchase("later", 2000)
+        self.features.bill_callback(call)
+        self.assertEqual(self.features.store.report(7)[0]["paid"], 0)
+        self.assertEqual(len(self.features.store.payment_history(7)), 2)
+
+    def test_manual_bill_send_failure_leaves_payment_unchanged(self):
+        self.purchase()
+        self.message.from_user.id = 1
+        self.message.text = "/seller paid 7"
+        self.bot.send_message.side_effect = RuntimeError("offline")
+        self.features.command(self.message)
+        self.assertIn("Payment was not changed", self.messages[-1])
+        self.assertEqual(self.features.store.report(7)[0]["paid"], 0)
+
+    def test_old_manual_bill_does_not_trigger_historical_auto_send(self):
+        self.now -= timedelta(days=1)
+        self.purchase()
+        bill = self.features.store.manual_bill(7)
+        self.features.store.manual_bill_sent(bill["bill_id"], 1, 499)
+        self.now += timedelta(days=1)
+        self.features.send_daily_bills()
+        self.bot.send_message.assert_not_called()
+
+    def test_bill_callback_on_other_bot_cannot_change_payment(self):
+        self.purchase()
+        bill = self.features.store.manual_bill(7)
+        self.features.store.manual_bill_sent(bill["bill_id"], 1, 500)
+        other_bot = Mock()
+        self.core.active_bot_for = lambda message: other_bot
+        self.features.bill_callback(self.bill_call(f"sellerbill:{bill['bill_id']}:paid"))
+        self.assertEqual(self.features.store.report(7)[0]["paid"], 0)
+        other_bot.answer_callback_query.assert_called_once()
+
+    def test_reseller_invalid_command_shows_only_reseller_help(self):
+        self.message.text = "/seller paid 7"
+        self.features.command(self.message)
+        self.assertNotIn("/seller paid", self.messages[-1])
+        self.assertNotIn("/seller disable", self.messages[-1])
+        self.assertIn("/seller history", self.messages[-1])
+
+    def test_manual_payment_at_9pm_and_later_purchases(self):
+        self.now = self.now.replace(hour=21)
+        self.purchase()
+        self.message.from_user.id = 1
+        self.message.chat.id = 1
+        self.message.text = "/seller paid 7"
+        self.features.command(self.message)
+        sent = self.bot.send_message.call_args
+        self.assertIn("Total: $0.50", sent.args[1])
+        self.assertIn("2026-09-13", sent.args[1])
+        self.assertEqual(self.features.store.report(7)[0]["paid"], 0)
+        button = sent.kwargs["reply_markup"].keyboard[0][0]
+        self.features.bill_callback(self.bill_call(button.callback_data))
+        self.features.bill_callback(self.bill_call(button.callback_data))
+        self.assertEqual(self.features.store.report(7)[0]["paid"], 50)
+        self.purchase("later", 2000)
+        self.features.bill_callback(self.bill_call(button.callback_data))
+        report = self.features.store.report(7)[0]
+        self.assertEqual(report["cents"] - report["paid"], 100)
+        self.bot.send_message.reset_mock()
+        self.features.send_daily_bills()
+        self.bot.send_message.assert_not_called()
+        self.now = datetime(2026, 9, 14, 3, tzinfo=ICT)
+        self.features.send_daily_bills()
+        self.assertIn("Due: $1.00", self.bot.send_message.call_args.args[1])
+
+    def test_manual_bill_does_not_replace_end_of_day_bill(self):
+        self.purchase()
+        bill = self.features.store.manual_bill(7)
+        self.features.store.manual_bill_sent(bill["bill_id"], 1, 499)
+        self.features.send_daily_bills()
+        self.bot.send_message.assert_not_called()
+        self.now = datetime(2026, 9, 14, 2, 59, tzinfo=ICT)
+        self.assertEqual(self.features.store.manual_bill(7)["day"], "2026-09-13")
+        self.now += timedelta(minutes=1)
+        self.features.send_daily_bills()
+        self.bot.send_message.assert_called_once()
+
+    def test_daily_cutoff_bill_buttons_and_no_resend(self):
+        self.purchase()
+        self.now = datetime(2026, 9, 14, 2, 59, 59, tzinfo=ICT)
+        self.features.send_daily_bills()
+        self.bot.send_message.assert_not_called()
+        self.now += timedelta(seconds=1)
+        self.features.send_daily_bills()
+        self.bot.send_message.assert_called_once()
+        call = self.bot.send_message.call_args
+        self.assertEqual(call.args[0], 1)
+        self.assertIn("2026-09-13", call.args[1])
+        self.assertIn("Total: $0.50", call.args[1])
+        self.assertIn("Dara Sok", call.args[1])
+        buttons = call.kwargs["reply_markup"].keyboard[0]
+        self.assertEqual([b.text for b in buttons], ["✅ Paid", "⏳ Pending"])
+        self.features.send_daily_bills()
+        self.bot.send_message.assert_called_once()
+
+    def bill_call(self, data, user_id=1):
+        return SimpleNamespace(id="bill-tap", data=data, from_user=SimpleNamespace(id=user_id),
+                               message=SimpleNamespace(chat=SimpleNamespace(id=1), message_id=500))
+
+    def test_owner_only_paid_pending_and_date_isolation(self):
+        self.purchase()
+        self.now += timedelta(days=1)
+        self.features.send_daily_bills()
+        buttons = self.bot.send_message.call_args.kwargs["reply_markup"].keyboard[0]
+        self.purchase("today", 2000)
+        self.features.bill_callback(self.bill_call(buttons[0].callback_data, user_id=7))
+        self.assertEqual(self.features.store.report(7, "2026-09-13")[0]["paid"], 0)
+        self.features.bill_callback(self.bill_call(buttons[0].callback_data))
+        self.assertEqual(self.features.store.report(7, "2026-09-13")[0]["paid"], 50)
+        self.assertEqual(self.features.store.report(7, "2026-09-14")[0]["paid"], 0)
+        self.assertIn("Status: Paid", self.bot.edit_message_text.call_args.kwargs["text"])
+        self.features.bill_callback(self.bill_call(buttons[1].callback_data))
+        self.assertEqual(self.features.store.report(7, "2026-09-13")[0]["paid"], 0)
+        self.assertEqual(self.features.store.report(7)[0]["remaining"], 8)
+
+    def test_unsent_bill_retried_after_restart_and_no_empty_bills(self):
+        self.purchase()
+        self.now += timedelta(days=2)
+        self.bot.send_message.side_effect = RuntimeError("offline")
+        self.features.send_daily_bills()
+        self.assertEqual(len(self.features.store.pending_daily_bills()), 1)
+        restarted = ResellerFeatures(self.core)
+        restarted.store.now = lambda: self.now
+        self.bot.send_message.side_effect = None
+        restarted.send_daily_bills()
+        self.assertEqual(restarted.store.pending_daily_bills(), [])
+        self.assertEqual(self.features.store.report(7)[0]["remaining"], 9)
+        self.assertIn("2026-09-13", self.bot.send_message.call_args.args[1])
+
+    def test_bill_waits_for_inflight_and_rejects_changed_snapshot(self):
+        self.purchase()
+        self.now = datetime(2026, 9, 14, 2, 59, tzinfo=ICT)
+        self.features.store.reserve(7, "pending", "likeff", "123")
+        self.now += timedelta(minutes=1)
+        self.features.send_daily_bills()
+        self.bot.send_message.assert_not_called()
+        self.features.store.finish_manual("pending", 220)
+        self.features.send_daily_bills()
+        buttons = self.bot.send_message.call_args.kwargs["reply_markup"].keyboard[0]
+        self.assertIn("Total: $0.70", self.bot.send_message.call_args.args[1])
+        # Model a delayed accounting update on that same closed billing day.
+        with self.features.store.db() as db:
+            db.execute("UPDATE seller_events SET cents=100 WHERE event_id='purchase'")
+        self.features.bill_callback(self.bill_call(buttons[0].callback_data))
+        self.assertEqual(self.features.store.report(7, "2026-09-13")[0]["paid"], 0)
+        self.assertTrue(self.bot.answer_callback_query.call_args.kwargs["show_alert"])
+        self.bot.send_message.return_value = SimpleNamespace(message_id=501)
+        self.features.send_daily_bills()
+        self.assertIn("Total: $1.20", self.bot.send_message.call_args.args[1])
+
+    def test_pending_bill_reminder_after_24_hours_only_once(self):
+        self.purchase()
+        self.now += timedelta(days=1)
+        self.features.send_daily_bills()
+        self.bot.send_message.reset_mock()
+        self.now += timedelta(hours=23, minutes=59, seconds=59)
+        self.features.send_bill_reminders()
+        self.bot.send_message.assert_not_called()
+        self.now += timedelta(seconds=1)
+        self.bot.send_message.return_value = SimpleNamespace(message_id=501)
+        self.features.send_bill_reminders()
+        self.bot.send_message.assert_called_once()
+        call = self.bot.send_message.call_args
+        self.assertEqual(call.args[0], 1)
+        self.assertIn("RESELLER PAYMENT REMINDER", call.args[1])
+        self.assertIn("Due: $0.50", call.args[1])
+        self.assertEqual([b.text for b in call.kwargs["reply_markup"].keyboard[0]], ["✅ Paid", "⏳ Pending"])
+        self.now += timedelta(days=1)
+        restarted = ResellerFeatures(self.core)
+        restarted.store.now = lambda: self.now
+        restarted.send_bill_reminders()
+        self.bot.send_message.assert_called_once()
+        self.assertEqual(restarted.store.report(7)[0]["remaining"], 9)
+
+    def test_reminder_paid_button_updates_both_messages(self):
+        self.purchase()
+        self.now += timedelta(days=1)
+        self.features.send_daily_bills()
+        self.now += timedelta(hours=24)
+        self.bot.send_message.return_value = SimpleNamespace(message_id=501)
+        self.features.send_bill_reminders()
+        button = self.bot.send_message.call_args.kwargs["reply_markup"].keyboard[0][0]
+        call = self.bill_call(button.callback_data)
+        call.message.message_id = 501
+        self.features.bill_callback(call)
+        self.assertEqual(self.features.store.report(7, "2026-09-13")[0]["paid"], 50)
+        edits = self.bot.edit_message_text.call_args_list
+        self.assertEqual({e.kwargs["message_id"] for e in edits}, {500, 501})
+        self.assertTrue(all("Status: Paid" in e.kwargs["text"] for e in edits))
+
+    def test_paid_bill_skipped_and_failed_reminder_retried(self):
+        self.purchase()
+        self.now += timedelta(days=1)
+        self.features.send_daily_bills()
+        bill_buttons = self.bot.send_message.call_args.kwargs["reply_markup"].keyboard[0]
+        self.features.bill_callback(self.bill_call(bill_buttons[0].callback_data))
+        self.now += timedelta(hours=24)
+        self.bot.send_message.reset_mock()
+        self.features.send_bill_reminders()
+        self.bot.send_message.assert_not_called()
+        self.features.bill_callback(self.bill_call(bill_buttons[1].callback_data))
+        self.bot.send_message.side_effect = RuntimeError("offline")
+        self.features.send_bill_reminders()
+        self.assertEqual(len(self.features.store.due_bill_reminders()), 1)
+        restarted = ResellerFeatures(self.core)
+        restarted.store.now = lambda: self.now
+        self.bot.send_message.side_effect = None
+        self.bot.send_message.return_value = SimpleNamespace(message_id=501)
+        restarted.send_bill_reminders()
+        self.assertEqual(restarted.store.due_bill_reminders(), [])
 
 
 class DeliveryCoordinationTests(unittest.TestCase):

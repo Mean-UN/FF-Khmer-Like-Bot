@@ -32,6 +32,8 @@ request_usage.sqlite3
 request_usage.sqlite3-*
 resellers.sqlite3
 resellers.sqlite3-*
+token_refresh_alerts.sqlite3
+token_refresh_alerts.sqlite3-*
 Guest-*.json
 
 # Logs and temporary files

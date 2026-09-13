@@ -12,6 +12,7 @@ from html import escape
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from reseller_bot import ResellerFeatures
+from token_refresh_alerts import TokenRefreshAlerts, refresh_all, failure_report, coalesced_refresh
 
 import requests
 import telebot
@@ -53,6 +54,7 @@ DAILY_RESET_HOUR = 5
 DAILY_RESET_MINUTE = 30
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 resellers = ResellerFeatures(sys.modules[__name__])
+token_refresh_alerts = TokenRefreshAlerts(os.path.join(BASE_DIR, "token_refresh_alerts.sqlite3"))
 UIDPASS_FILE_SETS = {
     "like": ("uidpass.json", "tokens.json"),
     "likeff": ("uidpass_likeff.json", "tokens_likeff.json"),
@@ -622,12 +624,25 @@ def find_uidpass_index(accounts, uid):
     return -1
 
 
+@coalesced_refresh
 def run_token_update(set_name, slot=None):
     command = [sys.executable, os.path.join(BASE_DIR, "update_like_tokens.py"), set_name]
     if slot:
         command.extend(["--slot", str(slot)])
-    result = subprocess.run(command, cwd=BASE_DIR, capture_output=True, text=True, timeout=900)
+    try:
+        result = subprocess.run(command, cwd=BASE_DIR, capture_output=True, text=True, encoding="utf-8", errors="replace", env={**os.environ, "PYTHONIOENCODING": "utf-8"}, timeout=900)
+    except Exception as exc:
+        logger.warning("Token refresh process failed for %s slot %s: %s", set_name, slot, type(exc).__name__)
+        output = getattr(exc, "stdout", None) or getattr(exc, "output", None) or ""
+        if isinstance(output, bytes):
+            output = output.decode("utf-8", errors="replace")
+        token_refresh_alerts.enqueue(failure_report(set_name, slot, output))
+        return 1, output
     output = (result.stdout or "") + (result.stderr or "")
+    if result.returncode:
+        error_types = re.findall(r"(?m)^([A-Za-z_][A-Za-z0-9_]*(?:Error|Exception)):", output)
+        logger.warning("Token refresh exited for %s slot %s: code=%s error=%s", set_name, slot, result.returncode, error_types[-1] if error_types else "Account failures or unclassified error")
+        token_refresh_alerts.enqueue(failure_report(set_name, slot, output))
     return result.returncode, output.strip()
 
 
@@ -643,7 +658,7 @@ def run_single_token_update(set_name, uid, password, slot=None):
 def token_refresh_targets():
     targets = [("like", None)]
     for slot in range(1, LIKEFF_SLOT_COUNT + 1):
-        if os.path.exists(uidpass_path_for("likeff", slot)):
+        if os.path.exists(uidpass_path_for("likeff", slot)) or os.path.exists(token_path_for("likeff", slot)):
             targets.append(("likeff", slot))
     return targets
 
@@ -1436,9 +1451,9 @@ def format_autolike_delivery(order, data, likes_sent, private=False):
 
 
 def notify_autolike_order(order, group_text, private_text=None):
+    active_bot = bot
     if order.get("seller_event_id"):
         resellers.store.record_order(order)
-        active_bot = bot
         if user_bot and order.get("notification_bot_id") == user_bot.token.split(":")[0]:
             active_bot = user_bot
         try:
@@ -1448,7 +1463,7 @@ def notify_autolike_order(order, group_text, private_text=None):
     group_id = order.get("group_id")
     if group_id:
         try:
-            bot.send_message(int(group_id), group_text, parse_mode=None)
+            active_bot.send_message(int(group_id), group_text, parse_mode=None)
         except Exception as exc:
             logger.warning("Autolike group notify failed for %s: %s", group_id, exc)
 
@@ -1970,15 +1985,19 @@ def build_help_text(chat_id=None, user_id=None, active_bot=None, page="main"):
             "━━━━━━━━━━━━━━━━━━",
             "❤️ /like <uid> - Send likes to a player",
             "💎 /likeff <uid> - Send premium like",
-            "🧾 /seller - Reseller daily usage and bill",
-            "🔁 /autolikeff <uid> <package_likes> - Reseller AutoLikeFF order",
-            "➕ /extend <uid> <package_likes> - Extend your AutoLikeFF order",
             "👤 /ffinfo <uid> - View full player profile",
             "📊 /level <uid> - Check level EXP progress",
             "🌍 /region <uid> - Check player region",
             "📦 /myautolike - View your AutoLikeFF orders",
             "📝 /bio <access_token|jwt|uidpass> <new_bio> - Update profile bio",
         ]
+        if user_id and resellers.allowed(user_id):
+            lines.extend([
+                "",
+                "🧾 /seller - Reseller daily usage and bill",
+                "🔁 /autolikeff <uid> <package_likes> - Reseller AutoLikeFF order",
+                "➕ /extend <uid> <package_likes> - Extend your AutoLikeFF order",
+            ])
         return "\n".join(lines)
 
     if page == "admin":
@@ -2058,8 +2077,8 @@ def build_help_text(chat_id=None, user_id=None, active_bot=None, page="main"):
             "📊 /slotusage [1-30] - Check daily LikeFF slot requests",
             "👥 /seller <telegram_id> <requests> - Add reseller requests",
             "🧾 /seller summary [YYYY-MM-DD] - Daily reseller bills",
-            "📜 /seller history <telegram_id> [page] - Reseller history",
-            "✅ /seller paid <telegram_id> <YYYY-MM-DD> - Record payment",
+            "📜 /seller history <telegram_id> - Reseller history with page buttons",
+            "🧾 Automatic daily reseller bills - Use Paid / Pending buttons",
             "⛔ /seller disable <telegram_id> - Disable new purchases",
             "",
             "👑 OWNER INFO",
@@ -3084,6 +3103,16 @@ def autolikeff_command(message):
 @bot.message_handler(commands=["seller"])
 def seller_command(message):
     resellers.command(message)
+
+
+@bot.callback_query_handler(func=lambda call: str(call.data or "").startswith("sellerhist:"))
+def seller_history_callback(call):
+    resellers.history_callback(call)
+
+
+@bot.callback_query_handler(func=lambda call: str(call.data or "").startswith("sellerbill:"))
+def seller_bill_callback(call):
+    resellers.bill_callback(call)
 
 
 @bot.message_handler(commands=["autolike"])
@@ -4995,36 +5024,20 @@ def process_autolikeff_near_end_notices():
 def process_auto_token_refresh():
     while True:
         try:
-            logger.info("Starting automatic token refresh for all token sets")
-            for set_name, slot in token_refresh_targets():
-                label = f"{set_name} slot {slot}" if slot else set_name
-                try:
-                    code, output = run_token_update(set_name, slot)
-                    if code == 0:
-                        logger.info("Automatic token refresh completed for %s", label)
-                    else:
-                        logger.warning("Automatic token refresh failed for %s: %s", label, output[-1000:])
-                        if OWNER_ID:
-                            report = output
-                            marker = "UID/PASS Token Refresh Report"
-                            if marker in report:
-                                line_start = report.rfind("\n", 0, report.find(marker))
-                                report = report[(line_start + 1) if line_start >= 0 else report.find(marker):]
-                            text = "\n".join([
-                                f"⚠️ {label.upper()} TOKEN REFRESH FAILED",
-                                "━━━━━━━━━━━━━━━━━━",
-                                report[:3500],
-                            ])
-                            try:
-                                bot.send_message(OWNER_ID, text, parse_mode=None)
-                            except Exception as send_exc:
-                                logger.warning("Could not send token refresh report to owner: %s", send_exc)
-                except Exception as exc:
-                    logger.warning("Automatic token refresh crashed for %s: %s", label, exc)
-            logger.info("Next automatic token refresh in 7 hours")
+            refresh_all(token_refresh_targets(), run_token_update, token_refresh_alerts, logger, report_failures=False)
         except Exception:
             logger.exception("Automatic token refresh worker failed")
         time.sleep(TOKEN_AUTO_REFRESH_INTERVAL)
+
+
+def process_token_refresh_alerts():
+    while True:
+        try:
+            token_refresh_alerts.send_pending(bot, OWNER_ID, logger)
+        except Exception:
+            logger.exception("Token refresh alert worker failed")
+        time.sleep(30)
+
 
 
 def bind_handler_to_bot(handler, active_bot):
@@ -5057,6 +5070,8 @@ def register_user_bot_handlers():
     user_bot.callback_query_handler(func=lambda call: call.data == "verify_join")(bind_handler_to_bot(verify_join_callback, user_bot))
     user_bot.callback_query_handler(func=lambda call: call.data == "help_main")(bind_handler_to_bot(help_callback, user_bot))
     user_bot.callback_query_handler(func=lambda call: str(call.data or "").startswith("help_page:"))(bind_handler_to_bot(help_page_callback, user_bot))
+    user_bot.callback_query_handler(func=lambda call: str(call.data or "").startswith("sellerhist:"))(bind_handler_to_bot(seller_history_callback, user_bot))
+    user_bot.callback_query_handler(func=lambda call: str(call.data or "").startswith("sellerbill:"))(bind_handler_to_bot(seller_bill_callback, user_bot))
 
 
 def poll_telegram_bot(active_bot, label):
@@ -5077,10 +5092,12 @@ register_user_bot_handlers()
 if __name__ == "__main__":
     if not acquire_bot_instance_lock():
         raise SystemExit(1)
+    threading.Thread(target=resellers.process_owner_alerts, daemon=True).start()
     threading.Thread(target=reset_limits, daemon=True).start()
     threading.Thread(target=process_autolike_orders, args=("like",), daemon=True).start()
     threading.Thread(target=process_autolikeff_orders, daemon=True).start()
     threading.Thread(target=process_autolikeff_near_end_notices, daemon=True).start()
+    threading.Thread(target=process_token_refresh_alerts, daemon=True).start()
     threading.Thread(target=process_auto_token_refresh, daemon=True).start()
     if user_bot:
         threading.Thread(target=poll_telegram_bot, args=(user_bot, "User bot"), daemon=True).start()

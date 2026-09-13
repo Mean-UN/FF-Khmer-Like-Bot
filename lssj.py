@@ -817,9 +817,10 @@ def assign_likeff_slot(uid):
 
     raise RuntimeError(f"All {LIKEFF_SLOT_COUNT} LikeFF slots are already full today")
 
-def fetch_guest_jwt_for_like(uid, password):
+def fetch_guest_jwt_for_like(uid, password, session=None):
+    session = session if session is not None else http_session
     uid_int = int(uid)
-    auth_response = http_session.post(
+    auth_response = session.post(
         "https://100067.connect.garena.com/api/v2/oauth/guest/token:grant",
         json={
             "client_id": 100067,
@@ -839,7 +840,7 @@ def fetch_guest_jwt_for_like(uid, password):
         raise ValueError("guest token grant did not return access_token/open_id")
 
     req_msg = build_major_login_request(open_id, access_token)
-    login_response = http_session.post(
+    login_response = session.post(
         "https://loginbp.ggpolarbear.com/MajorLogin",
         data=BmwNoiNoiBmvYasYas(G, F, req_msg.SerializeToString()),
         headers={
@@ -873,11 +874,11 @@ def fetch_guest_jwt_for_like(uid, password):
         "token": jwt_token,
     }
 
-def fetch_guest_jwt_for_like_with_retry(uid, password, max_retries=LIKE_TOKEN_MAX_RETRIES, retry_delay=LIKE_TOKEN_RETRY_DELAY):
+def fetch_guest_jwt_for_like_with_retry(uid, password, max_retries=LIKE_TOKEN_MAX_RETRIES, retry_delay=LIKE_TOKEN_RETRY_DELAY, session=None):
     last_error = None
     for attempt in range(1, max_retries + 1):
         try:
-            return fetch_guest_jwt_for_like(uid, password)
+            return fetch_guest_jwt_for_like(uid, password, session=session) if session is not None else fetch_guest_jwt_for_like(uid, password)
         except Exception as e:
             last_error = e
             if attempt < max_retries:

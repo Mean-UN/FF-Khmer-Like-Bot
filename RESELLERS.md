@@ -11,8 +11,6 @@ Owner commands:
 /seller summary
 /seller summary 2026-09-13
 /seller history 123456789
-/seller history 123456789 2
-/seller paid 123456789 2026-09-13
 /seller disable 123456789
 ```
 
@@ -34,7 +32,6 @@ Reseller commands:
 /seller
 /seller summary 2026-09-13
 /seller history
-/seller history 2
 ```
 
 The reseller's Telegram ID comes from the sender. Full first and last names
@@ -43,6 +40,66 @@ commands, and each purchase retains the name recorded at that time. If Telegram
 cannot resolve a newly added user, their ID is shown until they use the bot.
 Resellers can use their commands privately in either configured bot; they do
 not gain owner permissions or access to anyone else's orders.
+History shows the reseller's name and ID once, followed by seven entries per
+page. Use Previous and Next buttons to navigate within the same message; no
+page number needs to be typed. Only the owner or the history's reseller may
+use its buttons. Both configured Telegram bots support navigation.
+
+The primary bot privately alerts `OWNER_ID` after each successful manual
+LikeFF purchase, new AutoLikeFF order, or reseller extension. Alerts include
+the reseller's full name/ID, player UID, likes/package, charge, remaining
+requests and daily total. Zero-like manual results and failed purchases do
+not alert. Scheduled deliveries do not generate another purchase alert.
+The owner must have started the primary bot and allow its private messages.
+Alerts are queued in SQLite and sent by a background worker, with failed sends
+retried every 30 seconds. Existing historical purchases are not backfilled.
+Queued alerts survive restarts; a crash after Telegram accepts an alert but
+before its acknowledgement is saved can result in a repeated notification.
+
+At the 03:00 Cambodia billing cutoff, the owner receives a private daily bill
+for each reseller with charges that day. Each bill has **Paid** and **Pending**
+buttons. Paid records payment for that reseller and date only. Pending marks
+that day's bill unpaid again (including undoing a mistaken Paid tap). Neither
+button adds or removes reseller requests. Only the owner may use the buttons.
+The bill message updates to show the payment status and amount due.
+
+The worker checks every 30 seconds and waits for requests still in flight at
+the cutoff to finish or release their holds. Empty days do not generate bills.
+Automatic billing starts with the day the updated worker first runs; it does
+not send all historical bills on installation. Thereafter, missed days and
+failed sends are caught up after restart. Bill delivery records prevent normal
+repeat sends. The same send/acknowledgement crash caveat as purchase alerts applies.
+If a closed day's amount changes, an updated bill is sent; old bill buttons
+cannot silently mark a different amount paid. `/seller paid <id>` opens the
+current billing day's bill privately with its total and Paid/Pending buttons.
+Opening it does not record payment: tap Paid after receiving the money.
+An optional `YYYY-MM-DD` selects an older day. Later purchases remain due;
+reopen the bill to pay the updated total. Manual bills do not replace the
+automatic 03:00 bill or start its 24-hour reminder timer.
+
+For a partial payment, use `/seller paid <id> 2.00`. This opens a private
+confirmation for an **additional $2.00**, not a replacement paid total. Tap
+**Confirm payment** after receiving the money. Amounts must be positive USD
+values with at most two decimal places and cannot exceed the amount due.
+Use `/seller paid <id> 2.00 YYYY-MM-DD` for an older billing day.
+Confirmation is stored durably and repeated taps cannot add the payment again.
+If the paid amount or bill changes before confirmation, open a new command.
+Paid still settles the full displayed bill; Pending clears all payments for
+that date. Neither action changes request credits or purchase charges.
+
+Owner command `/seller payments <id>` shows payment changes, newest first,
+including timestamp, billing day, owner ID, action, and the paid amount before
+and after the change. This audit history starts with this update; previous
+payment totals remain intact, but historical taps cannot be reconstructed.
+Taps which do not change the amount do not add duplicate audit entries.
+
+If a bill is still unpaid 24 hours after its initial message was sent, the owner
+receives one private payment reminder with the same Paid/Pending buttons.
+Paid bills are skipped. The reminder is sent once per bill revision, persists
+across restarts, and failed sends retry every 30 seconds. It does not repeat
+every day. Either message's buttons update both the original and reminder when
+possible; requests and charges do not change. On upgrade, existing bills whose
+send time was not previously stored begin their 24-hour timer at the upgrade.
 
 ## Counting and pricing
 

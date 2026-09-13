@@ -1,9 +1,14 @@
+# API server
 Flask
 flask-cors
+# HTTP clients and SOCKS proxy support
 requests
 httpx
 urllib3
-pyTelegramBotAPI
-protobuf
-pycryptodome
 PySocks
+# Telegram bot (provides the telebot module)
+pyTelegramBotAPI
+# Generated protobuf files require runtime 6.33.1 or newer
+protobuf>=6.33.1
+# Provides Crypto.Cipher.AES
+pycryptodome

@@ -1,6 +1,8 @@
 """Telegram reseller commands; all external actions use the existing bot helpers."""
 import os
+import json
 import threading
+import re
 from datetime import date
 
 from reseller_pricing import PACKAGE_PRICES_CENTS, format_usd, package_price_cents
@@ -11,6 +13,131 @@ class ResellerFeatures:
     def __init__(self, core):
         self.core = core
         self.store = ResellerStore(os.path.join(core.BASE_DIR, "resellers.sqlite3"))
+        self.owner_alert_wakeup = threading.Event()
+
+    def send_owner_alerts(self):
+        owner_id = getattr(self.core, "OWNER_ID", 0)
+        if not owner_id:
+            return
+        for event in self.store.pending_owner_alerts():
+            try:
+                report = self.store.report(event["user_id"], event["day"])[0]
+                labels = {"likeff": "LIKEFF", "autolikeff": "AUTOLIKEFF ORDER", "autolikeff_extend": "AUTOLIKEFF EXTENSION"}
+                lines = ["🔔 RESELLER REQUEST SUCCESS", "━━━━━━━━━━━━━━━━━━━━",
+                         f"👤 {event['name']}", f"🆔 Telegram: {event['user_id']}",
+                         f"🕒 {event['created_at'][:19].replace('T', ' ')}",
+                         f"📌 {labels[event['kind']]}", f"🎮 UID: {event['uid']}"]
+                if event["kind"] == "likeff":
+                    lines.append(f"❤️ Likes sent: {event['likes']:,}")
+                else:
+                    lines.append(f"🎯 Package: {event['package']:,} likes")
+                lines.extend([f"💵 Charge: {format_usd(event['cents'])}",
+                              f"🎟 Requests left now: {report['remaining']}",
+                              f"📅 Bill date: {event['day']}", f"💵 Daily total: {format_usd(report['cents'])}"])
+                self.core.bot.send_message(int(owner_id), "\n".join(lines), parse_mode=None)
+                self.store.owner_alert_sent(event["event_id"])
+            except Exception as exc:
+                self.core.logger.warning("Reseller owner alert failed; will retry: %s", exc)
+                break
+
+    def process_owner_alerts(self):
+        while True:
+            self.owner_alert_wakeup.clear()
+            try:
+                self.send_owner_alerts()
+                self.send_daily_bills()
+                self.send_bill_reminders()
+            except Exception:
+                self.core.logger.exception("Reseller owner alert worker failed")
+            self.owner_alert_wakeup.wait(30)
+
+    def bill_view(self, bill, reminder=False):
+        payload = json.loads(bill["payload"])
+        manual = [event for event in payload["events"] if event["kind"] == "likeff"]
+        auto = [event for event in payload["events"] if event["kind"] != "likeff"]
+        paid = self.store.bill_paid_amount(bill)
+        total = bill["total_cents"]
+        title = "⏰ RESELLER PAYMENT REMINDER" if reminder else "🧾 RESELLER DAILY BILL"
+        lines = [title, "━━━━━━━━━━━━━━━━━━━━", f"📅 {bill['day']}", "",
+                 f"👤 {payload['name']}", f"🆔 {bill['user_id']}",
+                 f"💎 LikeFF: {len(manual)} req · {format_usd(sum(e['cents'] for e in manual))}",
+                 f"🔁 AutoLikeFF: {len(auto)} orders/extensions · {sum(e['package'] for e in auto):,} likes"]
+        packages = {}
+        for event in auto:
+            key = (event["package"], event["cents"])
+            packages[key] = packages.get(key, 0) + 1
+        for (package, cents), count in sorted(packages.items()):
+            lines.append(f"  • {package:,} × {count} · {format_usd(cents * count)}")
+        lines.extend(["", f"💵 Total: {format_usd(total)}", f"✅ Paid: {format_usd(paid)}",
+                      f"🧾 Due: {format_usd(max(0, total - paid))}",
+                      "✅ Status: Paid" if paid >= total else "⏳ Status: Pending"])
+        keyboard = self.core.InlineKeyboardMarkup(row_width=2)
+        keyboard.row(self.core.InlineKeyboardButton("✅ Paid", callback_data=f"sellerbill:{bill['bill_id']}:paid"),
+                     self.core.InlineKeyboardButton("⏳ Pending", callback_data=f"sellerbill:{bill['bill_id']}:pending"))
+        return "\n".join(lines), keyboard
+
+    def send_daily_bills(self):
+        owner_id = getattr(self.core, "OWNER_ID", 0)
+        if not owner_id:
+            return
+        self.store.prepare_daily_bills()
+        for bill in self.store.pending_daily_bills():
+            try:
+                text, keyboard = self.bill_view(bill)
+                sent = self.core.bot.send_message(int(owner_id), text, parse_mode=None, reply_markup=keyboard)
+                self.store.daily_bill_sent(bill["bill_id"], int(owner_id), sent.message_id)
+            except Exception as exc:
+                self.core.logger.warning("Daily reseller bill failed; will retry: %s", exc)
+                break
+
+    def bill_callback(self, call):
+        active_bot = self.core.active_bot_for(call)
+        if not self.core.is_owner(call.from_user.id):
+            active_bot.answer_callback_query(call.id, "Owner only.", show_alert=True)
+            return
+        if active_bot is not self.core.bot:
+            active_bot.answer_callback_query(call.id, "Use the bill in your private chat with the main bot.", show_alert=True)
+            return
+        try:
+            prefix, raw_id, status = str(call.data or "").split(":")
+            if prefix != "sellerbill" or not raw_id.isascii() or not raw_id.isdigit():
+                raise SellerError("Invalid bill")
+            if not getattr(call, "message", None) or call.message.chat.id != self.core.OWNER_ID:
+                raise SellerError("Use the bill sent to your private chat")
+            bill = self.store.set_bill_status(int(raw_id), status, call.message.chat.id, call.message.message_id, actor_id=call.from_user.id)
+        except ValueError as exc:
+            active_bot.answer_callback_query(call.id, str(exc), show_alert=True)
+            return
+        active_bot.answer_callback_query(call.id, "Payment recorded." if status.startswith("partial") else ("Marked paid." if status == "paid" else "Marked pending (unpaid)."))
+        messages = [(bill["chat_id"], bill["message_id"], False),
+                    (bill["reminder_chat_id"], bill["reminder_message_id"], True)]
+        messages.extend(self.store.manual_bill_messages(bill["bill_id"]))
+        for chat_id, message_id, reminder in messages:
+            if message_id is None:
+                continue
+            text, keyboard = self.bill_view(bill, reminder=reminder)
+            try:
+                active_bot.edit_message_text(text=text, chat_id=chat_id,
+                                             message_id=message_id, parse_mode=None, reply_markup=keyboard)
+            except Exception as exc:
+                if "message is not modified" not in str(exc).lower():
+                    self.core.logger.warning("Bill status saved but message update failed: %s", exc)
+
+    def send_bill_reminders(self):
+        owner_id = getattr(self.core, "OWNER_ID", 0)
+        if not owner_id:
+            return
+        for bill in self.store.due_bill_reminders():
+            try:
+                # A payment may have been recorded after the queue was read.
+                if self.store.bill_paid_amount(bill) >= bill["total_cents"]:
+                    continue
+                text, keyboard = self.bill_view(bill, reminder=True)
+                sent = self.core.bot.send_message(int(owner_id), text, parse_mode=None, reply_markup=keyboard)
+                self.store.bill_reminder_sent(bill["bill_id"], int(owner_id), sent.message_id)
+            except Exception as exc:
+                self.core.logger.warning("Reseller bill reminder failed; will retry: %s", exc)
+                break
 
     def allowed(self, user_id):
         seller = self.store.seller(user_id)
@@ -56,6 +183,7 @@ class ResellerFeatures:
         # A crash before export can be recovered without charging twice.
         self.core.save_autolike_orders(orders, "likeff")
         self.store.exported([key for key, _ in pending])
+        self.owner_alert_wakeup.set()
         return orders
 
     def manual_call(self, message, params):
@@ -82,6 +210,8 @@ class ResellerFeatures:
             error = "Invalid like count. No reseller request deducted."
             data = {"success": False, "error": error}
         self.store.finish_manual(key, likes, error)
+        if likes > 0:
+            self.owner_alert_wakeup.set()
         report = self.store.report(message.from_user.id)[0]
         return {**data, "seller_charge": format_usd(20 if likes > 0 else 0),
                 "seller_requests": f"{report['remaining']} left",
@@ -109,7 +239,8 @@ class ResellerFeatures:
                     "telegram_user_id": str(message.from_user.id),
                     "telegram_user_name": self.core.requester_name(message.from_user),
                     "telegram_username": getattr(message.from_user, "username", None) or "",
-                    "group_id": "", "created_by": str(message.from_user.id),
+                    "group_id": self.core.resolve_autolike_group_id(message),
+                    "created_by": str(message.from_user.id),
                     "created_at": self.store.now().strftime("%d %b %Y %H:%M:%S"),
                     "status": "active", "last_period": "", "last_error": "",
                     "next_run_date": self.core.next_autolike_run_date(kind="likeff"),
@@ -196,21 +327,61 @@ class ResellerFeatures:
         return "\n".join(lines)
 
     def history_text(self, user_id, page):
-        events = self.store.history(user_id, page=page)
-        lines = [f"📜 RESELLER HISTORY · Page {page}", "━━━━━━━━━━━━━━━━━━━━"]
+        events, _, _ = self.store.history_page(user_id, page)
+        return self.format_history(user_id, events)
+
+    def format_history(self, user_id, events):
+        seller = self.store.seller(user_id)
+        name = seller["name"] if seller else (events[0]["name"] if events else str(user_id))
+        lines = ["📜 RESELLER HISTORY", "━━━━━━━━━━━━━━━━━━━━", "", f"👤 {name}", f"🆔 {user_id}"]
         for event in events:
             charge = event["cents"] if event["state"] == "charged" else 0
-            lines.extend(["", f"👤 {event['name']} · {event['user_id']}",
+            lines.extend(["",
                           f"🕒 {event['created_at'][:19].replace('T', ' ')}",
                           f"{event['kind'].upper()} · UID {event['uid']}",
                           f"🎯 Package: {event['package']:,} · ❤️ Sent: {event['likes']:,}",
                           f"💵 {format_usd(charge)} · {event['state']}"])
-            if event["detail"]:
-                lines.append(event["detail"][:200])
         if not events:
-            lines.append("No history on this page.")
-        lines.append("\nUse the next page number to see older history.")
+            lines.extend(["", "No history yet."])
         return "\n".join(lines)
+
+    def history_view(self, user_id, page=1):
+        events, page, pages = self.store.history_page(user_id, page)
+        keyboard = self.core.InlineKeyboardMarkup(row_width=3)
+        buttons = []
+        if page > 1:
+            buttons.append(self.core.InlineKeyboardButton("⬅️ Previous", callback_data=f"sellerhist:{user_id}:{page - 1}"))
+        if pages > 1:
+            buttons.append(self.core.InlineKeyboardButton(f"{page} / {pages}", callback_data=f"sellerhist:{user_id}:{page}"))
+        if page < pages:
+            buttons.append(self.core.InlineKeyboardButton("Next ➡️", callback_data=f"sellerhist:{user_id}:{page + 1}"))
+        if buttons:
+            keyboard.row(*buttons)
+        return self.format_history(user_id, events), keyboard if buttons else None
+
+    def history_callback(self, call):
+        active_bot = self.core.active_bot_for(call)
+        try:
+            prefix, target, raw_page = str(call.data or "").split(":")
+            if prefix != "sellerhist" or not target.isascii() or not target.isdigit() or not raw_page.isascii() or not raw_page.isdigit():
+                raise ValueError("Invalid page")
+            if not (self.core.is_owner(call.from_user.id) or str(call.from_user.id) == target):
+                active_bot.answer_callback_query(call.id, "You can only view your own history.", show_alert=True)
+                return
+            if not getattr(call, "message", None):
+                raise ValueError("History message unavailable")
+            text, keyboard = self.history_view(target, int(raw_page))
+        except ValueError:
+            active_bot.answer_callback_query(call.id, "Invalid history page.", show_alert=True)
+            return
+        # Acknowledge every tap, including tapping the current page indicator.
+        active_bot.answer_callback_query(call.id)
+        try:
+            active_bot.edit_message_text(text=text, chat_id=call.message.chat.id,
+                                         message_id=call.message.message_id, reply_markup=keyboard, parse_mode=None)
+        except Exception as exc:
+            if "message is not modified" not in str(exc).lower():
+                self.core.logger.warning("Could not update reseller history page: %s", exc)
 
     def command(self, message):
         active_bot = self.core.active_bot_for(message)
@@ -238,28 +409,75 @@ class ResellerFeatures:
                 self.store.disable(args[1])
                 self.reply(message, "✅ Reseller disabled. History is preserved and existing orders continue.")
                 return
-            if owner and len(args) == 3 and args[0] == "paid":
-                day = date.fromisoformat(args[2]).isoformat()
-                cents = self.store.mark_paid(args[1], day, command_id=self.key(message))
-                self.reply(message, f"✅ Recorded payment: {format_usd(cents)}\n📅 {day}\n🆔 {args[1]}")
+            if owner and len(args) == 2 and args[0] == "payments":
+                seller_record = self.store.seller(args[1])
+                if not seller_record:
+                    raise SellerError("Reseller not found")
+                lines = ["📜 RESELLER PAYMENT HISTORY", "━━━━━━━━━━━━━━━━━━━━", f"👤 {seller_record['name']}", f"🆔 {args[1]}"]
+                for entry in self.store.payment_history(args[1]):
+                    delta = entry["after_cents"] - entry["before_cents"]
+                    lines.extend(["", f"🕒 {entry['created_at'][:19].replace('T', ' ')}", f"📅 Bill: {entry['day']}",
+                                  f"📌 {entry['action'].upper()} · {'+' if delta >= 0 else '-'}{format_usd(abs(delta))}",
+                                  f"✅ Paid: {format_usd(entry['before_cents'])} → {format_usd(entry['after_cents'])}", f"👤 Changed by: {entry['actor_id']}"])
+                if len(lines) == 4:
+                    lines.extend(["", "No payment changes recorded yet."])
+                self.reply(message, "\n".join(lines))
+                return
+            if owner and len(args) in (2, 3, 4) and args[0] == "paid":
+                day, cents = self.store.day(), None
+                if len(args) >= 3:
+                    if len(args) == 3 and re.fullmatch(r"\d{4}-\d{2}-\d{2}", args[2]):
+                        day = date.fromisoformat(args[2]).isoformat()
+                    else:
+                        if not re.fullmatch(r"[0-9]{1,9}(?:\.[0-9]{1,2})?", args[2]):
+                            raise SellerError("Use a positive dollar amount with at most 2 decimal places, for example: /seller paid <id> 2.00")
+                        whole, _, fraction = args[2].partition(".")
+                        cents = int(whole) * 100 + int(fraction.ljust(2, "0"))
+                        if len(args) == 4:
+                            day = date.fromisoformat(args[3]).isoformat()
+                bill = self.store.manual_bill(args[1], day)
+                text, keyboard = self.bill_view(bill)
+                intent_id = None
+                if cents is not None:
+                    intent_id = self.store.prepare_partial_payment(bill, cents, self.key(message))
+                    text += f"\n\n💵 Payment received: {format_usd(cents)}\nTap Confirm payment to add this amount."
+                    keyboard = self.core.InlineKeyboardMarkup(row_width=1)
+                    keyboard.row(self.core.InlineKeyboardButton("✅ Confirm payment", callback_data=f"sellerbill:{bill['bill_id']}:partial{intent_id}"))
+                try:
+                    sent = self.core.bot.send_message(int(self.core.OWNER_ID), text, parse_mode=None, reply_markup=keyboard)
+                except Exception:
+                    self.core.logger.exception("Could not send manual reseller bill")
+                    self.reply(message, "⚠️ Could not send your bill. Open the main bot's private chat, send /start, then retry /seller paid " + args[1] + ". Payment was not changed.")
+                    return
+                self.store.manual_bill_sent(bill["bill_id"], int(self.core.OWNER_ID), sent.message_id)
+                if intent_id is not None:
+                    self.store.partial_payment_sent(intent_id, int(self.core.OWNER_ID), sent.message_id)
+                if message.chat.id != self.core.OWNER_ID or active_bot is not self.core.bot:
+                    self.reply(message, "🧾 Bill sent to your private chat with the main bot. Use its button to record payment.")
                 return
             if args and args[0] == "history":
                 if owner:
                     if len(args) not in (2, 3):
-                        raise SellerError("Use: /seller history <telegram_id> [page]")
+                        raise SellerError("Use: /seller history <telegram_id>")
                     target, page = args[1], int(args[2]) if len(args) == 3 else 1
                 else:
                     if len(args) > 2:
-                        raise SellerError("Use: /seller history [page]")
+                        raise SellerError("Use: /seller history")
                     target, page = message.from_user.id, int(args[1]) if len(args) == 2 else 1
                 if page < 1:
                     raise SellerError("Page must be positive")
-                self.reply(message, self.history_text(target, page))
+                if not str(target).isascii() or not str(target).isdigit():
+                    raise SellerError("Telegram ID must be a number")
+                target = str(int(target))
+                text, keyboard = self.history_view(target, page)
+                active_bot.reply_to(message, text, parse_mode=None, reply_markup=keyboard)
                 return
             if not args or (args[0] == "summary" and len(args) <= 2):
                 day = date.fromisoformat(args[1]).isoformat() if len(args) == 2 else self.store.day()
                 self.reply(message, self.format_report(self.store.report(None if owner else message.from_user.id, day), day))
                 return
-            raise SellerError("Owner: /seller <id> <requests_to_add>, /seller summary [YYYY-MM-DD], /seller history <id> [page], /seller paid <id> <YYYY-MM-DD>, /seller disable <id>\nReseller: /seller, /seller history [page], /seller summary [YYYY-MM-DD]")
+            if owner:
+                raise SellerError("Use: /seller <id> <requests_to_add>, /seller summary [YYYY-MM-DD], /seller history <id>, /seller paid <id> [amount] [YYYY-MM-DD], /seller payments <id>, /seller disable <id>.")
+            raise SellerError("Use: /seller, /seller history, /seller summary [YYYY-MM-DD]")
         except (ValueError, SellerError) as exc:
             self.reply(message, f"⚠️ {exc}")

@@ -1,5 +1,11 @@
 import json
 import sys
+import os
+import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import requests
 
 import lssj
 
@@ -43,7 +49,14 @@ def read_uidpass(uidpass_file):
 
 def fetch_jwt(uid, password):
     try:
-        return lssj.fetch_guest_jwt_for_like_with_retry(uid, password)
+        with requests.Session() as session:
+            for attempt in range(3):
+                try:
+                    return lssj.fetch_guest_jwt_for_like_with_retry(uid, password, max_retries=1, session=session)
+                except Exception:
+                    if attempt == 2:
+                        raise
+                    time.sleep(2 ** (attempt + 1))
     except BaseException as exc:
         if isinstance(exc, KeyboardInterrupt):
             raise
@@ -51,8 +64,22 @@ def fetch_jwt(uid, password):
 
 
 def update_token_file(tokens, token_file):
-    with open(token_file, "w", encoding="utf-8") as f:
-        json.dump(tokens, f, ensure_ascii=False, indent=4)
+    name = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=os.path.dirname(os.path.abspath(token_file)), delete=False) as f:
+            name = f.name
+            json.dump(tokens, f, ensure_ascii=False, indent=4)
+        for attempt in range(6):
+            try:
+                os.replace(name, token_file)
+                break
+            except PermissionError:
+                if attempt == 5:
+                    raise
+                time.sleep(0.1 * (2 ** attempt))
+    finally:
+        if name and os.path.exists(name):
+            os.unlink(name)
 
 
 def read_tokens(token_file):
@@ -116,9 +143,10 @@ def main():
     duplicate_uids = []
     seen_uids = set()
 
+    unique_accounts = []
     for account in accounts:
-        uid = account.get("uid")
-        password = account.get("password")
+        uid = account.get("uid") if isinstance(account, dict) else None
+        password = account.get("password") if isinstance(account, dict) else None
         if not uid or not password:
             failures.append({"uid": uid or "N/A", "password": password or "N/A", "error": "missing uid or password"})
             continue
@@ -127,17 +155,49 @@ def main():
             duplicate_uids.append(uid)
             continue
         seen_uids.add(uid)
-        try:
-            tokens.append(fetch_jwt(uid, password))
-            print(f"updated token for UID {uid}")
-        except BaseException as e:
-            if isinstance(e, KeyboardInterrupt):
-                raise
-            failures.append({"uid": uid, "password": password, "error": str(e)})
-            print(f"failed UID {uid}: {e}")
+        unique_accounts.append((uid, password))
 
-    update_token_file(tokens, token_file)
-    print(f"{token_file} updated with {len(tokens)} token(s).")
+    def report_progress():
+        print("REFRESH_PROGRESS " + json.dumps({
+            "refreshed": len(tokens), "failed": len(failures),
+            "unfinished": len(accounts) - len(duplicate_uids) - len(tokens) - len(failures),
+            "duplicates": len(duplicate_uids), "duplicate_uids": duplicate_uids,
+        }), flush=True)
+
+    report_progress()
+
+    def refresh_account(account):
+        uid, password = account
+        try:
+            return fetch_jwt(uid, password), None
+        except Exception:
+            return None, {"uid": uid}
+
+    saved_tokens = {str(item.get("uid")): item for item in read_tokens(token_file)
+                    if isinstance(item, dict) and str(item.get("uid")) in seen_uids}
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        jobs = [pool.submit(refresh_account, account) for account in unique_accounts]
+        for future in as_completed(jobs):
+            token, failure = future.result()
+            if failure:
+                failures.append(failure)
+                report_progress()
+                print(f"failed UID {failure['uid']}")
+            else:
+                tokens.append(token)
+                report_progress()
+                saved_tokens[str(token["uid"])] = token
+                # Batch checkpoints to avoid rewriting a large file per account.
+                if len(tokens) == 1 or len(tokens) % 20 == 0:
+                    update_token_file(list(saved_tokens.values()), token_file)
+                print(f"updated token for UID {token['uid']}")
+
+    if tokens or not accounts:
+        update_token_file(list(saved_tokens.values()) if accounts else [], token_file)
+        print(f"{token_file} updated with {len(tokens)} token(s).")
+    else:
+        print("No tokens refreshed; existing token file preserved.")
+    print("REFRESH_STATS " + json.dumps({"refreshed": len(tokens), "failed": len(failures)}))
     if failures:
         print("")
         print("🔄 UID/PASS Token Refresh Report")
@@ -147,9 +207,6 @@ def main():
         print("")
         print("")
         print(f"🆔 Duplicate UID: {', '.join(duplicate_uids) if duplicate_uids else 'None'}")
-        print("🔐 Failed UID/PASS:")
-        for item in failures:
-            print(f"- {item['uid']}:{item['password']}")
         return 1
     return 0
 
