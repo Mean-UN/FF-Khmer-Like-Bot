@@ -95,6 +95,9 @@ class RefreshTests(unittest.TestCase):
     def load_updater(self):
         spec = importlib.util.spec_from_file_location("isolated_token_updater", "update_like_tokens.py")
         module = importlib.util.module_from_spec(spec)
+        sleep_patch = patch("time.sleep")
+        sleep_patch.start()
+        self.addCleanup(sleep_patch.stop)
         with patch.dict(sys.modules, {"lssj": SimpleNamespace()}):
             spec.loader.exec_module(module)
         module.FILE_SETS = {"like": (str(Path(self.temp.name) / "accounts.json"), str(Path(self.temp.name) / "tokens.json"))}
@@ -193,7 +196,36 @@ class RefreshTests(unittest.TestCase):
         with patch.object(module.requests, "Session"), patch.object(module.time, "sleep") as sleep:
             self.assertEqual(module.fetch_jwt("1", "secret"), {"token": "ok"})
         self.assertEqual(fetch.call_count, 2)
-        sleep.assert_called_once_with(2)
+        sleep.assert_called_once()
+        self.assertGreaterEqual(sleep.call_args.args[0], 2)
+        self.assertLessEqual(sleep.call_args.args[0], 3)
+
+    def test_recovery_pass_only_retries_failed_accounts(self):
+        module = self.load_updater()
+        accounts, tokens = map(Path, module.FILE_SETS["like"])
+        accounts.write_text(json.dumps([{"uid": str(i), "password": "fake"} for i in (1, 2)]))
+        attempts = {}
+        def fetch(uid, password):
+            attempts[uid] = attempts.get(uid, 0) + 1
+            if uid == "2" and attempts[uid] == 1:
+                raise RuntimeError("temporary")
+            return {"uid": uid, "token": "fake"}
+        out = io.StringIO()
+        with patch.object(module, "fetch_jwt", side_effect=fetch), patch.object(sys, "argv", ["update", "like"]), contextlib.redirect_stdout(out):
+            self.assertEqual(module.main(), 0)
+        self.assertEqual(attempts, {"1": 1, "2": 2})
+        self.assertEqual(len(json.loads(tokens.read_text())), 2)
+        self.assertIn('"refreshed": 2, "failed": 0', out.getvalue())
+
+    def test_rate_limit_retry_after_is_respected(self):
+        module = self.load_updater()
+        response = SimpleNamespace(status_code=429, headers={"Retry-After": "20"})
+        error = module.requests.HTTPError("rate limited", response=response)
+        module.lssj.fetch_guest_jwt_for_like_with_retry = Mock(side_effect=[error, {"token": "ok"}])
+        with patch.object(module.requests, "Session"), patch.object(module.time, "sleep") as sleep:
+            module.fetch_jwt("1", "fake")
+        self.assertGreaterEqual(sleep.call_args.args[0], 20)
+        self.assertLessEqual(sleep.call_args.args[0], 21)
 
     def test_three_slots_parallel_and_summary_counts(self):
         barrier = threading.Barrier(3)

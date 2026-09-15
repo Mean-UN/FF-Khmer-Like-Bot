@@ -3,6 +3,7 @@ import sys
 import os
 import tempfile
 import time
+import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
@@ -53,14 +54,20 @@ def fetch_jwt(uid, password):
             for attempt in range(3):
                 try:
                     return lssj.fetch_guest_jwt_for_like_with_retry(uid, password, max_retries=1, session=session)
-                except Exception:
+                except Exception as exc:
                     if attempt == 2:
                         raise
-                    time.sleep(2 ** (attempt + 1))
+                    delay = 2 ** (attempt + 1)
+                    response = getattr(exc, "response", None)
+                    if response is not None:
+                        retry_after = response.headers.get("Retry-After", "")
+                        if str(retry_after).isdigit():
+                            delay = max(delay, min(60, int(retry_after)))
+                    time.sleep(delay + random.uniform(0, 1))
     except BaseException as exc:
         if isinstance(exc, KeyboardInterrupt):
             raise
-        raise RuntimeError(str(exc) or exc.__class__.__name__) from None
+        raise
 
 
 def update_token_file(tokens, token_file):
@@ -170,27 +177,49 @@ def main():
         uid, password = account
         try:
             return fetch_jwt(uid, password), None
-        except Exception:
-            return None, {"uid": uid}
+        except Exception as exc:
+            response = getattr(exc, "response", None)
+            reason = f"HTTP_{response.status_code}" if response is not None else type(exc).__name__
+            return None, {"uid": uid, "reason": reason}
 
     saved_tokens = {str(item.get("uid")): item for item in read_tokens(token_file)
                     if isinstance(item, dict) and str(item.get("uid")) in seen_uids}
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        jobs = [pool.submit(refresh_account, account) for account in unique_accounts]
-        for future in as_completed(jobs):
-            token, failure = future.result()
-            if failure:
-                failures.append(failure)
-                report_progress()
-                print(f"failed UID {failure['uid']}")
-            else:
-                tokens.append(token)
-                report_progress()
-                saved_tokens[str(token["uid"])] = token
-                # Batch checkpoints to avoid rewriting a large file per account.
-                if len(tokens) == 1 or len(tokens) % 20 == 0:
-                    update_token_file(list(saved_tokens.values()), token_file)
-                print(f"updated token for UID {token['uid']}")
+    pending = unique_accounts
+    for round_number in range(2):
+        if not pending:
+            break
+        if round_number:
+            print(f"Retrying {len(pending)} accounts after cooldown with reduced concurrency", flush=True)
+            time.sleep(15 + random.uniform(0, 3))
+            retry_uids = {uid for uid, _ in pending}
+            failures[:] = [failure for failure in failures if "reason" not in failure or failure["uid"] not in retry_uids]
+            report_progress()
+        retry_accounts = []
+        with ThreadPoolExecutor(max_workers=4 if round_number == 0 else 2) as pool:
+            jobs = {pool.submit(refresh_account, account): account for account in pending}
+            for future in as_completed(jobs):
+                token, failure = future.result()
+                if failure:
+                    failures.append(failure)
+                    retry_accounts.append(jobs[future])
+                    report_progress()
+                else:
+                    tokens.append(token)
+                    report_progress()
+                    saved_tokens[str(token["uid"])] = token
+                    if len(tokens) == 1 or len(tokens) % 20 == 0:
+                        update_token_file(list(saved_tokens.values()), token_file)
+                    print(f"updated token for UID {token['uid']}")
+        pending = retry_accounts
+
+    for failure in failures:
+        print(f"failed UID {failure['uid']}")
+    reasons = {}
+    for failure in failures:
+        reason = failure.get("reason", "InvalidAccountEntry")
+        reasons[reason] = reasons.get(reason, 0) + 1
+    if reasons:
+        print("REFRESH_ERRORS " + json.dumps(reasons), flush=True)
 
     if tokens or not accounts:
         update_token_file(list(saved_tokens.values()) if accounts else [], token_file)

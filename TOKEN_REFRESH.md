@@ -3,7 +3,11 @@
 The seven-hour automatic cycle refreshes three token sets/slots concurrently.
 Each updater refreshes four accounts concurrently, with its own HTTP session
 per account and up to three attempts, waiting two and then four seconds
-between failed attempts. Successful accounts are not retried. Actual duration depends on upstream
+between failed attempts, plus random jitter to spread retries. Numeric
+Retry-After responses increase the delay up to 60 seconds. After the first
+pass, failed accounts get one recovery pass after a 15–18 second cooldown,
+using two workers per slot. Successful accounts are not retried. The recovery
+pass permits up to three further attempts per failed account. Actual duration depends on upstream
 responses; each slot subprocess retains its 15-minute timeout. Concurrent
 full-slot requests from automatic refresh, manual commands, and AutoLikeFF
 recovery in the same bot process share one running job and its result.
@@ -25,6 +29,9 @@ not all have reached the latest disk checkpoint. If the updater fails before
 reading accounts and emitting any progress, counts remain unavailable.
 Slots with token files but missing credentials are checked and reported too.
 The bot must remain running and the owner must allow private messages from it.
+Remaining account failures log aggregate error categories (for example,
+HTTP_429 or Timeout), without passwords, tokens, or raw server responses.
+The compact Telegram report counts only failures remaining after recovery.
 If the process stops after Telegram accepts a message but before acknowledging
 it in SQLite, a duplicate notification can occur on restart.
 

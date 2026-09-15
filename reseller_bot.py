@@ -231,8 +231,20 @@ class ResellerFeatures:
             key = self.key(message)
             with self.core.autolike_lock:
                 orders = self.core.load_autolike_orders("likeff")
-                if self.core.find_existing_autolike_order(orders, uid):
-                    raise SellerError("An active order already exists for this UID. No request or charge added.")
+                existing_order = self.core.find_existing_autolike_order(orders, uid)
+                if existing_order:
+                    own_order = existing_order.get("seller_event_id") and str(existing_order.get("created_by")) == str(message.from_user.id)
+                    lines = ["⚠️ AUTOLIKEFF ORDER EXISTS", "━━━━━━━━━━━━━━━━━━"]
+                    if own_order:
+                        lines.append(f"🧾 Order ID: {existing_order.get('order_id', 'N/A')}")
+                    lines.append(f"🆔 UID: {uid}")
+                    if own_order:
+                        lines.extend(["📌 Use /extend <uid> <package_likes> to add more likes.",
+                                      f"➕ Example: /extend {uid} {package}"])
+                    else:
+                        lines.append("📌 This order belongs to another user. Contact the owner for help.")
+                    self.reply(message, "\n".join(lines))
+                    return
                 order = {
                     "order_id": self.core.next_autolike_order_id(orders), "kind": "likeff", "uid": uid,
                     "total_likes": package, "sent_likes": 0,

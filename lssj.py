@@ -832,6 +832,7 @@ def fetch_guest_jwt_for_like(uid, password, session=None):
         },
         timeout=15,
     )
+    auth_response.raise_for_status()
     auth_data = response_json_or_text(auth_response)
     inner = auth_data.get("data", {}) if isinstance(auth_data, dict) else {}
     access_token = inner.get("access_token")

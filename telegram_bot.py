@@ -64,7 +64,7 @@ AUTOLIKEFF_CHECK_INTERVAL = 60
 AUTOLIKEFF_DEFAULT_BATCH = 220
 AUTOLIKE_RUN_HOUR = 18
 AUTOLIKE_RUN_MINUTE = 0
-AUTOLIKEFF_RUN_HOUR = 9
+AUTOLIKEFF_RUN_HOUR = 4
 AUTOLIKEFF_RUN_MINUTE = 0
 AUTOLIKEFF_NOTICE_HOUR = 19
 AUTOLIKEFF_NOTICE_MINUTE = 0
@@ -640,6 +640,14 @@ def run_token_update(set_name, slot=None):
         return 1, output
     output = (result.stdout or "") + (result.stderr or "")
     if result.returncode:
+        for line in output.splitlines():
+            if line.startswith("REFRESH_ERRORS "):
+                try:
+                    categories = json.loads(line[len("REFRESH_ERRORS "):])
+                    if isinstance(categories, dict) and all(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key) and type(value) is int and value >= 0 for key, value in categories.items()):
+                        logger.warning("Token refresh failure categories for %s slot %s: %s", set_name, slot, categories)
+                except (ValueError, TypeError):
+                    pass
         error_types = re.findall(r"(?m)^([A-Za-z_][A-Za-z0-9_]*(?:Error|Exception)):", output)
         logger.warning("Token refresh exited for %s slot %s: code=%s error=%s", set_name, slot, result.returncode, error_types[-1] if error_types else "Account failures or unclassified error")
         token_refresh_alerts.enqueue(failure_report(set_name, slot, output))
@@ -1260,7 +1268,7 @@ def format_autolike_summary(orders, kind="likeff"):
         f"⏳ Total Remaining: {remaining_likes:,}",
         f"📈 Progress: {progress:.2f}%",
         "",
-        f"🕘 Daily Run: {run_hour:02d}:{run_minute:02d} Cambodia",
+        f"{'🕓' if kind == 'likeff' else '🕕'} Daily Run: {run_hour:02d}:{run_minute:02d} Cambodia",
         f"⏱ Delay Between Orders: {AUTOLIKEFF_ORDER_DELAY}s",
     ])
 
