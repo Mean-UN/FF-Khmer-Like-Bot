@@ -1,11 +1,13 @@
 """Guest activation using the supplied token / MajorLogin / GetLoginData flow."""
 
 import json
+import time
 from datetime import datetime
 from urllib.parse import urlparse
 import requests
+import guest_protocol
 from Crypto.Cipher import AES
-from Crypto.Util.Padding import pad
+from Crypto.Util.Padding import pad, unpad
 
 
 def decode_protobuf(data):
@@ -64,7 +66,15 @@ def parse_accounts(raw):
     return accounts
 
 
-def activate_guest(uid, password):
+def activate_guest(uid, password, region="IND"):
+    for attempt in range(5):
+        result = _activate_guest_once(uid, password, region)
+        if result.get("success") or not result.get("retryable") or attempt == 4:
+            return result
+        time.sleep(min(2 ** attempt, 8))
+
+
+def _activate_guest_once(uid, password, region="IND"):
     stage = "Token grant"
     try:
         with requests.Session() as session:
@@ -78,16 +88,31 @@ def activate_guest(uid, password):
             access, open_id = data.get("access_token"), data.get("open_id")
             if not access or not open_id:
                 return {"success": False, "uid": str(uid), "error": "Token grant did not return access_token/open_id"}
-            payload = major_login_payload(access, open_id, int(data.get("platform") or 4))
-            headers = {"X-Unity-Version": "2018.4.11f1", "ReleaseVersion": "OB54", "Content-Type": "application/x-www-form-urlencoded", "X-GA": "v1 1", "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 7.1.2; ASUS_Z01QD Build/QKQ1.190825.002)", "Connection": "Keep-Alive", "Accept-Encoding": "gzip"}
+            payload = major_login_payload(access, open_id, int(data.get("platform") or 4), region)
+            headers = {"X-Unity-Version": "2022.3.47f1", "ReleaseVersion": "OB54", "Content-Type": "application/x-www-form-urlencoded", "X-GA": "v1 1", "User-Agent": guest_protocol.random_ua(), "Connection": "Keep-Alive", "Accept-Encoding": "gzip"}
             stage = "MajorLogin"
-            response = session.post("https://loginbp.ggpolarbear.com/MajorLogin", data=payload, headers=headers, timeout=30)
+            response = session.post(f"https://{guest_protocol.region_host(region, region == 'GHOST')}/MajorLogin", data=payload, headers=headers, timeout=30)
             response.raise_for_status()
-            login = decode_protobuf(response.content)
+            candidates = []
+            try:
+                candidates.append(unpad(AES.new(aes_key, AES.MODE_CBC, aes_iv).decrypt(response.content), AES.block_size))
+            except ValueError:
+                pass
+            candidates.append(response.content)
+            login = {}
+            for content in candidates:
+                try:
+                    candidate = decode_protobuf(content)
+                    if isinstance(candidate.get(8), bytes) and isinstance(candidate.get(10), bytes):
+                        login = candidate
+                        break
+                except ValueError:
+                    continue
             jwt = login.get(8, b"").decode("utf-8")
             server = login.get(10, b"").decode("utf-8")
             if not jwt or not server:
                 raise ValueError("Missing JWT or server URL")
+            stage = "Login server validation"
             parsed = urlparse(server)
             domains = ("freefiremobile.com", "garenanow.com", "ggpolarbear.com", "ggblueshark.com", "ggbluefox.com")
             host = (parsed.hostname or "").lower()
@@ -103,7 +128,8 @@ def activate_guest(uid, password):
     except Exception as exc:
         response = getattr(exc, "response", None)
         reason = f"HTTP {response.status_code}" if response is not None else type(exc).__name__
-        return {"success": False, "uid": str(uid), "error": f"{stage} failed ({reason})"}
+        return {"success": False, "uid": str(uid), "error": f"{stage} failed ({reason})",
+                "retryable": stage == "MajorLogin" and isinstance(exc, ValueError)}
 
 aes_key = bytes([89, 103, 38, 116, 99, 37, 68, 69, 117, 104, 54, 37, 90, 99, 94, 56])
 
@@ -150,96 +176,11 @@ def encrypt_aes(hex_data):
     cipher = AES.new(aes_key, AES.MODE_CBC, aes_iv)
     return cipher.encrypt(pad(bytes.fromhex(hex_data), AES.block_size)).hex()
 
-def major_login_payload(access_token, open_id, platform_type):
-    """Build the major login payload"""
-    fields = {
-        3: str(datetime.now())[:-7],
-        4: "free fire",
-        5: 1,
-        7: "1.129.16",
-        8: "Android OS 14 / API-34 (UKQ1.230917.001/V816.0.1.0.UMWJPSB)",
-        9: "Handheld",
-        11: "WIFI",
-        12: 1708,
-        13: 750,
-        14: "440",
-        15: "ARM64 FP ASIMD AES | 2208 | 8",
-        16: 3479,
-        17: "Adreno (TM) 613",
-        18: "OpenGL ES 3.2 V@0615.74 (GIT@dad4038ba6, If56d4a5bb8, 1690544947) (Date:07/28/23)",
-        19: "Google|27ed2fb9-7ace-4842-9ebf-0d42c7140201",
-        20: "103.13.194.48",
-        21: "en",
-
-        # Keep open_id dynamic
-        22: open_id,
-
-        # Keep platform_type dynamic
-        23: platform_type,
-
-        24: "Handheld",
-
-        # Updated nested value
-        25: {
-            11: 77,
-            12: 3544390361061879151
-        },
-
-        26: "IND",
-
-        # Keep access_token dynamic
-        29: access_token,
-
-        30: 1,
-        42: "WIFI",
-        57: "7428b253defc164018c604a1ebbfebdf",
-        60: 110509,
-        61: 21773,
-        62: 697,
-        64: 21900,
-        65: 110509,
-        66: 21901,
-        67: 110509,
-        73: 2,
-
-        74: "/data/app/~~EpSlHHqFKGJfMTVJpAvb5w==/"
-            "com.dts.freefireth-Shl9-60UzaOsFQ7x6PHgSg==/lib/arm64",
-
-        76: 1,
-
-        77: "1f74b435e72dfb267bce75a21d10074a|"
-            "/data/app/~~EpSlHHqFKGJfMTVJpAvb5w==/"
-            "com.dts.freefireth-Shl9-60UzaOsFQ7x6PHgSg==/base.apk",
-
-        78: 3,
-        79: 2,
-        81: "64",
-        83: "2019120913",
-        85: 3,
-        86: "OpenGLES2",
-        87: 4095,
-
-        # Keep platform_type dynamic
-        88: platform_type,
-
-        92: 10285,
-        93: "android",
-
-        94: "KqsHTyuSJ78t/H8E+JqM6PNc3n7w15pJi/"
-            "lyZ+7Y2kBYk3AJRBifvyrHKx40dPQZ+wMPwEsYJfRl/"
-            "joQS/k+WLPgL+E=",
-
-        95: 111207,
-        96: '{"cur_rate":[60,48,30,90],"support_etc2":false}',
-        97: 1,
-
-        # Keep platform_type dynamic
-        99: platform_type,
-        100: platform_type,
-
-        102: "40014546075a080937"
-    }
-
-    pyl = create_proto(fields).hex()
-    payload = bytes.fromhex(encrypt_aes(pyl))
-    return payload
+def major_login_payload(access_token, open_id, platform_type=4, region="IND"):
+    fields = guest_protocol.login_fields(region, open_id, access_token, region == "GHOST")
+    fields[23] = str(platform_type)
+    fields[88] = int(platform_type)
+    fields[99] = str(platform_type)
+    fields[100] = str(platform_type)
+    plain = bytes(create_proto(fields))
+    return AES.new(aes_key, AES.MODE_CBC, aes_iv).encrypt(pad(plain, AES.block_size))

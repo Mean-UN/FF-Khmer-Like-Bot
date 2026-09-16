@@ -407,6 +407,37 @@ class GuestActivationTests(unittest.TestCase):
         self.assertNotIn("Host", call.kwargs["headers"])
         self.assertNotIn("secret", str(result))
 
+    def test_current_login_payload_types(self):
+        plain = self.module.unpad(self.module.AES.new(self.module.aes_key, self.module.AES.MODE_CBC, self.module.aes_iv).decrypt(self.module.major_login_payload("access", "open", 4, "SG")), 16)
+        fields = self.module.decode_protobuf(plain)
+        self.assertEqual(fields[7], b"2.131.22")
+        self.assertEqual(fields[23], b"4")
+        self.assertEqual(fields[25], b"realme RMX2189")
+        self.assertEqual(fields[26], b"SG")
+        self.assertEqual(fields[99], b"4")
+        self.assertEqual(fields[100], b"4")
+
+    def test_major_login_value_error_retries_same_account_five_times(self):
+        failure = {"success": False, "error": "MajorLogin failed (ValueError)", "retryable": True}
+        with patch.object(self.module, "_activate_guest_once", return_value=failure) as once, patch.object(self.module.time, "sleep") as sleep:
+            self.assertFalse(self.module.activate_guest("123", "secret", "SG")["success"])
+        self.assertEqual(once.call_count, 5)
+        self.assertTrue(all(c.args == ("123", "secret", "SG") for c in once.call_args_list))
+        self.assertEqual(sleep.call_count, 4)
+
+    def test_retry_stops_on_success(self):
+        with patch.object(self.module, "_activate_guest_once", side_effect=[{"success": False, "retryable": True}, {"success": True}]) as once, patch.object(self.module.time, "sleep"):
+            self.assertTrue(self.module.activate_guest("123", "secret")["success"])
+        self.assertEqual(once.call_count, 2)
+
+    def test_encrypted_login_and_region_host(self):
+        self.configure()
+        responses = list(self.session.post.side_effect)
+        responses[1].content = self.module.AES.new(self.module.aes_key, self.module.AES.MODE_CBC, self.module.aes_iv).encrypt(self.module.pad(responses[1].content, 16))
+        self.session.post.side_effect = responses
+        self.assertTrue(self.module.activate_guest("123", "secret", "ME")["success"])
+        self.assertEqual(self.session.post.call_args_list[1].args[0], "https://loginbp.common.ggbluefox.com/MajorLogin")
+
     def test_no_login_data_is_not_success(self):
         self.configure(login_data=b"")
         self.assertFalse(self.module.activate_guest("123", "secret")["success"])
@@ -433,7 +464,7 @@ class GuestActivationTests(unittest.TestCase):
         tree = ast.parse(Path("telegram_bot.py").read_text(encoding="utf-8-sig"))
         names = ("guest_account_record", "generate_and_activate_guest")
         nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names]
-        api = Mock(return_value={"uid": "123", "password": "secret", "name": "original"})
+        api = Mock(return_value={"account_id": "456", "uid": "123", "password": "secret", "name": "original"})
         activate = Mock(side_effect=RuntimeError("offline"))
         ns = dict(call_api=api, activate_guest=activate)
         exec(compile(ast.Module(body=nodes, type_ignores=[]), "telegram_bot.py", "exec"), ns)
@@ -442,7 +473,30 @@ class GuestActivationTests(unittest.TestCase):
         self.assertEqual(account["uid"], "123")
         self.assertFalse(account["activated"])
         api.assert_called_once()
-        activate.assert_called_once_with("123", "secret")
+        activate.assert_called_once_with("123", "secret", region="SG")
+
+    def test_guestgen_replaces_missing_account_id(self):
+        tree = ast.parse(Path("telegram_bot.py").read_text(encoding="utf-8-sig"))
+        nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in ("guest_account_record", "generate_and_activate_guest")]
+        invalid = {"uid": "123", "password": "secret", "account_id": None}
+        valid = {"uid": "124", "password": "secret", "account_id": "456"}
+        api = Mock(side_effect=[invalid, valid])
+        activate = Mock(return_value={"success": True})
+        ns = dict(call_api=api, activate_guest=activate)
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), "telegram_bot.py", "exec"), ns)
+        progress = Mock()
+        record, error = ns["generate_and_activate_guest"]("SG", "name", progress)
+        self.assertEqual(record["uid"], "124")
+        self.assertIsNone(error)
+        activate.assert_called_once_with("124", "secret", region="SG")
+        self.assertEqual([c.args[0] for c in progress.call_args_list], ["created", "activated"])
+        api.side_effect = None
+        api.return_value = invalid
+        activate.reset_mock()
+        record, error = ns["generate_and_activate_guest"]("SG", "name")
+        self.assertIsNone(record)
+        self.assertIn("5 attempts", error)
+        activate.assert_not_called()
 
     def test_bulk_guestgen_three_workers_and_memory_output(self):
         from concurrent.futures import as_completed
@@ -451,20 +505,24 @@ class GuestActivationTests(unittest.TestCase):
         tree = ast.parse(Path("telegram_bot.py").read_text(encoding="utf-8-sig"))
         node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "process_guestgen")
         barrier = threading.Barrier(3)
-        def generate(region, name):
+        def generate(region, name, progress):
             barrier.wait(timeout=5)
+            progress("created")
+            progress("activated")
             return {"uid": "123", "password": "secret", "activated": True}, None
         bot = Mock()
         bot.send_message.return_value = SimpleNamespace(chat=SimpleNamespace(id=1), message_id=2)
         documents = []
         bot.send_document.side_effect = lambda chat, document, **kwargs: documents.append(json.loads(document.read()))
         ns = dict(bot=bot, ThreadPoolExecutor=ThreadPoolExecutor, as_completed=as_completed, generate_and_activate_guest=generate,
-                  time=time, logger=Mock(), datetime=datetime, json=json, io=io, safe_delete=Mock())
+                  time=time, threading=threading, logger=Mock(), datetime=datetime, json=json, io=io, safe_delete=Mock())
         exec(compile(ast.Module(body=[node], type_ignores=[]), "telegram_bot.py", "exec"), ns)
         message = SimpleNamespace(chat=SimpleNamespace(id=1), from_user=SimpleNamespace(first_name="Owner"))
         ns["process_guestgen"](message, "SG", "name", 3, True)
         self.assertEqual(len(documents[0]["items"]), 3)
         self.assertTrue(all(a["activated"] for a in documents[0]["items"]))
+        self.assertIn("Created: 3/3", bot.edit_message_text.call_args.kwargs["text"])
+        self.assertIn("Activated: 3/3", bot.edit_message_text.call_args.kwargs["text"])
 
     def test_command_owner_only_and_both_input_modes(self):
         tree = ast.parse(Path("telegram_bot.py").read_text(encoding="utf-8-sig"))

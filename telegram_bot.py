@@ -3415,7 +3415,7 @@ def guest_account_record(data):
     }
 
 
-def generate_and_activate_guest(region, name):
+def generate_and_activate_guest(region, name, progress=None):
     last_error = "Guest account generation failed"
     for _ in range(5):
         try:
@@ -3423,14 +3423,22 @@ def generate_and_activate_guest(region, name):
             if not data.get("uid") or not data.get("password"):
                 last_error = data.get("error") or "Guest account generation failed"
                 continue
+            account_id = str(data.get("account_id") or "").strip()
+            if not account_id.isascii() or not account_id.isdigit() or int(account_id) <= 0:
+                last_error = "Account ID missing; could not generate a valid replacement after 5 attempts"
+                continue
             # Preserve created credentials even if activation fails; don't create
             # a replacement account just because the activation server is down.
             record = guest_account_record(data)
+            if progress:
+                progress("created")
             try:
-                activation = activate_guest(record["uid"], record["password"])
+                activation = activate_guest(record["uid"], record["password"], region=record.get("region") or region)
             except Exception as exc:
                 activation = {"success": False, "error": f"Activation failed ({type(exc).__name__})"}
             record["activated"] = bool(activation.get("success"))
+            if record["activated"] and progress:
+                progress("activated")
             if not record["activated"]:
                 record["activation_error"] = activation.get("error") or "Activation failed"
             return record, None
@@ -3440,25 +3448,34 @@ def generate_and_activate_guest(region, name):
 
 
 def process_guestgen(message, region, name, total=None, file_mode=False):
-    status_msg = bot.send_message(message.chat.id, "? Generating and activating guest accounts?", parse_mode=None)
-    accounts, failures = [], []
     total = total or 1
+    status_msg = bot.send_message(message.chat.id, f"⏳ GUEST GENERATION\n━━━━━━━━━━━━━━━━━━\n📦 Created: 0/{total}\n✅ Activated: 0/{total}", parse_mode=None)
+    accounts, failures = [], []
+    counts = {"created": 0, "activated": 0}
+    progress_lock = threading.Lock()
     last_update = time.monotonic()
+
+    def progress(event):
+        nonlocal last_update
+        with progress_lock:
+            counts[event] += 1
+            if time.monotonic() - last_update < 3 and counts["activated"] != total:
+                return
+            try:
+                bot.edit_message_text(chat_id=status_msg.chat.id, message_id=status_msg.message_id,
+                    text=f"⏳ GUEST GENERATION\n━━━━━━━━━━━━━━━━━━\n📦 Created: {counts['created']}/{total}\n✅ Activated: {counts['activated']}/{total}", parse_mode=None)
+            except Exception:
+                logger.warning("Could not update guest generation progress")
+            last_update = time.monotonic()
+
     with ThreadPoolExecutor(max_workers=min(3, total)) as pool:
-        jobs = [pool.submit(generate_and_activate_guest, region, name) for _ in range(total)]
+        jobs = [pool.submit(generate_and_activate_guest, region, name, progress) for _ in range(total)]
         for job in as_completed(jobs):
             record, error = job.result()
             if record is not None:
                 accounts.append(record)
             else:
                 failures.append(error)
-            if time.monotonic() - last_update >= 10:
-                try:
-                    bot.edit_message_text(chat_id=status_msg.chat.id, message_id=status_msg.message_id,
-                        text=f"? Generating and activating guest accounts?\n?? Processed: {len(accounts) + len(failures)}/{total}\n? Activated: {sum(a['activated'] for a in accounts)}", parse_mode=None)
-                except Exception:
-                    logger.warning("Could not update guest generation progress")
-                last_update = time.monotonic()
 
     if not accounts:
         error_text = failures[0] if failures else "Guest account generation failed"
@@ -3472,7 +3489,8 @@ def process_guestgen(message, region, name, total=None, file_mode=False):
 
     if not file_mode:
         text = format_guestgen(accounts[0])
-        text += "\n\n" + ("? Guest activated" if accounts[0]["activated"] else "?? Activation failed. Credentials preserved; retry with /actguest.")
+        if accounts[0]["activated"]:
+            text += "\n\n✅ Guest activated"
         bot.edit_message_text(chat_id=status_msg.chat.id, message_id=status_msg.message_id, text=text[:3900], parse_mode="HTML")
         extra = text[3900:]
         while extra:
@@ -3491,12 +3509,12 @@ def process_guestgen(message, region, name, total=None, file_mode=False):
         "items": accounts,
     }
     caption = "\n".join([
-        "?? Guest Accounts File", f"?? Region: {region}",
-        f"?? Generated: {len(accounts)}/{total}",
-        f"? Activated: {sum(account['activated'] for account in accounts)}",
-        f"?? Activation failed: {sum(not account['activated'] for account in accounts)}",
-        f"? Generation failed: {len(failures)}",
-        f"?? Generated by: {generated_by}", f"? Generated at: {generated_at}",
+        "📄 Temporary Accounts File",
+        f"🌍 Region: {region}",
+        f"🔢 Accounts: {len(accounts)}",
+        f"✅ Activated: {sum(account['activated'] for account in accounts)}",
+        f"👤 Generated by: {generated_by}",
+        f"⏰ Generated at: {generated_at}",
     ])
     with io.BytesIO(json.dumps(file_payload, ensure_ascii=False, indent=2).encode("utf-8")) as guest_file:
         guest_file.name = filename
@@ -3549,10 +3567,11 @@ def process_guest_activation(message, accounts=None, document=None):
                  "━━━━━━━━━━━━━━━━━━", f"📦 Total: {len(accounts)}", f"✅ Activated: {succeeded}", f"❌ Failed: {len(failures)}"]
         if len(accounts) == 1:
             lines.append(f"🆔 UID: {accounts[0]['uid']}")
-        for item in failures[:15]:
+        visible_failures = [item for item in failures if item.get("error") != "MajorLogin failed (ValueError)"]
+        for item in visible_failures[:15]:
             lines.append(f"🆔 {item['uid']} · {item['error']}")
-        if len(failures) > 15:
-            lines.append(f"…and {len(failures) - 15} more failed accounts.")
+        if len(visible_failures) > 15:
+            lines.append(f"…and {len(visible_failures) - 15} more failed accounts.")
         text = "\n".join(lines)
     except (ValueError, UnicodeError):
         text = "❌ Invalid account JSON. Use a list of objects containing uid and password, without duplicate UIDs (maximum 10,000 accounts / 5 MB)."
