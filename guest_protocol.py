@@ -47,7 +47,7 @@ def login_fields(region, open_id, access_token, is_ghost=False):
             3: now,
             4: "free fire",
             5: 1,
-            7: "2.131.22",
+            7: "1.132.3",
             8: "Android OS 10 / API-29 (QP1A.190711.020/1617006012)",
             9: "Handheld",
             10: "Vi India",

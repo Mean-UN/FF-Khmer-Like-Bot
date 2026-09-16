@@ -89,9 +89,9 @@ def _activate_guest_once(uid, password, region="IND"):
             if not access or not open_id:
                 return {"success": False, "uid": str(uid), "error": "Token grant did not return access_token/open_id"}
             payload = major_login_payload(access, open_id, int(data.get("platform") or 4), region)
-            headers = {"X-Unity-Version": "2022.3.47f1", "ReleaseVersion": "OB54", "Content-Type": "application/x-www-form-urlencoded", "X-GA": "v1 1", "User-Agent": guest_protocol.random_ua(), "Connection": "Keep-Alive", "Accept-Encoding": "gzip"}
+            headers = {"X-Unity-Version": "2022.3.47f1", "ReleaseVersion": "OB55", "Content-Type": "application/x-www-form-urlencoded", "X-GA": "v1 1", "User-Agent": guest_protocol.random_ua(), "Connection": "Keep-Alive", "Accept-Encoding": "gzip"}
             stage = "MajorLogin"
-            response = session.post(f"https://{guest_protocol.region_host(region, region == 'GHOST')}/MajorLogin", data=payload, headers=headers, timeout=30)
+            response = session.post("https://loginbp.ppmainecoonghj.com/MajorLogin", data=payload, headers={**headers, "Host": "loginbp.ggpolarbear.com"}, timeout=30)
             response.raise_for_status()
             candidates = []
             try:
@@ -114,7 +114,7 @@ def _activate_guest_once(uid, password, region="IND"):
                 raise ValueError("Missing JWT or server URL")
             stage = "Login server validation"
             parsed = urlparse(server)
-            domains = ("freefiremobile.com", "garenanow.com", "ggpolarbear.com", "ggblueshark.com", "ggbluefox.com")
+            domains = ("freefiremobile.com", "garenanow.com", "ggpolarbear.com", "ggblueshark.com", "ggbluefox.com", "ppmainecoonghj.com")
             host = (parsed.hostname or "").lower()
             if parsed.scheme != "https" or parsed.username or parsed.password or parsed.port not in (None, 443) or not any(host == domain or host.endswith("." + domain) for domain in domains):
                 raise ValueError("Unexpected login server URL")

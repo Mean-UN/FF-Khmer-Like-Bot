@@ -317,10 +317,10 @@ class GuestGenerationTests(unittest.TestCase):
         self.ns["generate_custom_password"].assert_called_once_with("prefix")
         self.ns["generate_random_name"].assert_called_once_with("base")
         fields = self.ns["build_proto"].call_args_list[0].args[0]
-        self.assertEqual((fields[1], fields[15], fields[16], fields[20]), ("original-name", "pt", 2, "2.131.22"))
+        self.assertEqual((fields[1], fields[15], fields[16], fields[20]), ("original-name", "pt", 2, "1.132.1"))
         self.session.proxies.update.assert_called_once()
         login_fields = self.ns["build_proto"].call_args_list[1].args[0]
-        self.assertEqual((login_fields[7], login_fields[22], login_fields[26], login_fields[29]), ("2.131.22", "open", "BR", "access"))
+        self.assertEqual((login_fields[7], login_fields[22], login_fields[26], login_fields[29]), ("1.132.3", "open", "BR", "access"))
 
     def test_missing_token_fields_uses_fallback_endpoint(self):
         self.session.post.side_effect = [self.response({"data": {"uid": "7"}}), self.response({}), self.response({"data": {"access_token": "access", "open_id": "open"}}), self.response(), self.response()]
@@ -410,7 +410,7 @@ class GuestActivationTests(unittest.TestCase):
     def test_current_login_payload_types(self):
         plain = self.module.unpad(self.module.AES.new(self.module.aes_key, self.module.AES.MODE_CBC, self.module.aes_iv).decrypt(self.module.major_login_payload("access", "open", 4, "SG")), 16)
         fields = self.module.decode_protobuf(plain)
-        self.assertEqual(fields[7], b"2.131.22")
+        self.assertEqual(fields[7], b"1.132.3")
         self.assertEqual(fields[23], b"4")
         self.assertEqual(fields[25], b"realme RMX2189")
         self.assertEqual(fields[26], b"SG")
@@ -436,7 +436,7 @@ class GuestActivationTests(unittest.TestCase):
         responses[1].content = self.module.AES.new(self.module.aes_key, self.module.AES.MODE_CBC, self.module.aes_iv).encrypt(self.module.pad(responses[1].content, 16))
         self.session.post.side_effect = responses
         self.assertTrue(self.module.activate_guest("123", "secret", "ME")["success"])
-        self.assertEqual(self.session.post.call_args_list[1].args[0], "https://loginbp.common.ggbluefox.com/MajorLogin")
+        self.assertEqual(self.session.post.call_args_list[1].args[0], "https://loginbp.ppmainecoonghj.com/MajorLogin")
 
     def test_no_login_data_is_not_success(self):
         self.configure(login_data=b"")

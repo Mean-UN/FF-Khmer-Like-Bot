@@ -69,13 +69,13 @@ LIKEFF_UIDS_PER_SLOT = 30
 REGION_CACHE_FILE = "regions.json"
 LIKE_TOKEN_MAX_RETRIES = 10
 LIKE_TOKEN_RETRY_DELAY = 0.7
-BIO_MAJOR_LOGIN_URL = "https://loginbp.ggblueshark.com/MajorLogin"
+BIO_MAJOR_LOGIN_URL = "https://loginbp.ppmainecoonghj.com/MajorLogin"
 BIO_OAUTH_URL = "https://100067.connect.garena.com/oauth/guest/token/grant"
 BIO_INSPECT_URL = "https://100067.connect.garena.com/oauth/token/inspect"
-BIO_FREEFIRE_VERSION = "OB54"
+BIO_FREEFIRE_VERSION = "OB55"
 BIO_UPDATE_URLS = [
     "https://client.ind.freefiremobile.com/UpdateSocialBasicInfo",
-    "https://clientbp.ggblueshark.com/UpdateSocialBasicInfo",
+    "https://clientbp.ggpolarbear.com/UpdateSocialBasicInfo",
     "https://client.us.freefiremobile.com/UpdateSocialBasicInfo",
     "https://clientbp.common.ggbluefox.com/UpdateSocialBasicInfo",
 ]
@@ -90,6 +90,7 @@ BIO_HEADERS = {
     "Accept-Encoding": "gzip",
 }
 BIO_LOGIN_HEADERS = {
+    "Host": "loginbp.ggpolarbear.com",
     "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
     "Connection": "Keep-Alive",
     "Accept-Encoding": "gzip",
@@ -425,7 +426,7 @@ def build_major_login_request(open_id, access_token):
     req_msg.event_time = str(int(time.time()))
     req_msg.game_name = "free fire"
     req_msg.platform_id = 1
-    req_msg.client_version = "1.111.1"
+    req_msg.client_version = "1.132.3"
     req_msg.system_software = "Android OS 13 / API-33"
     req_msg.system_hardware = "CPH2095"
     req_msg.telecom_operator = "N/A"
@@ -449,7 +450,7 @@ def build_major_login_request(open_id, access_token):
     req_msg.platform_sdk_id = 1
     req_msg.network_operator_a = "N/A"
     req_msg.network_type_a = "WIFI"
-    req_msg.client_using_version = "1.111.1"
+    req_msg.client_using_version = "1.132.1"
     req_msg.external_storage_total = 64000
     req_msg.external_storage_available = 32000
     req_msg.internal_storage_total = 64000
@@ -465,7 +466,7 @@ def build_major_login_request(open_id, access_token):
     req_msg.channel_type = 3
     req_msg.cpu_type = 2
     req_msg.cpu_architecture = "arm64-v8a"
-    req_msg.client_version_code = "OB54"
+    req_msg.client_version_code = "OB55"
     req_msg.graphics_api = "OpenGLES2"
     req_msg.supported_astc_bitset = 0
     req_msg.login_open_id_type = 4
@@ -518,7 +519,7 @@ def major_register_url(region, is_ghost=False):
     return f"https://{guest_protocol.region_host(region, is_ghost)}/MajorRegister"
 
 def major_login_url(region, is_ghost=False):
-    return f"https://{guest_protocol.region_host(region, is_ghost)}/MajorLogin"
+    return "https://loginbp.ppmainecoonghj.com/MajorLogin"
 
 def get_region_proxies(region):
     candidates = get_region_proxy_candidates(region)
@@ -842,11 +843,12 @@ def fetch_guest_jwt_for_like(uid, password, session=None):
 
     req_msg = build_major_login_request(open_id, access_token)
     login_response = session.post(
-        "https://loginbp.ggpolarbear.com/MajorLogin",
+        "https://loginbp.ppmainecoonghj.com/MajorLogin",
         data=BmwNoiNoiBmvYasYas(G, F, req_msg.SerializeToString()),
         headers={
+            "Host": "loginbp.ggpolarbear.com",
             "X-GA": "v1 1",
-            "ReleaseVersion": "OB54",
+            "ReleaseVersion": "OB55",
             "Content-Type": "application/octet-stream",
             "User-Agent": USERAGENT,
             "Connection": "Keep-Alive",
@@ -998,10 +1000,12 @@ def create_guest_account_with_proxy(region, account_name, password_prefix, is_gh
             "User-Agent": guest_protocol.random_ua(),
         }
         if game:
-            values.update({"ReleaseVersion": "OB54", "X-GA": "v1 1",
+            values.update({"ReleaseVersion": "OB55", "X-GA": "v1 1",
                            "X-Unity-Version": "2022.3.47f1", "Expect": "100-continue"})
         else:
             values["Accept"] = "application/json"
+        if url.endswith("/MajorLogin"):
+            values["Host"] = "loginbp.ggpolarbear.com"
         return with_region_ip_headers(values, region)
 
     with requests.Session() as session:
@@ -1074,7 +1078,7 @@ def create_guest_account_with_proxy(region, account_name, password_prefix, is_gh
             lang_code = "pt" if is_ghost else guest_protocol.REGION_LANG.get(region, "en")
             payload = build_proto({1: name, 2: access_token, 3: open_id, 5: 102000007,
                                    6: 4, 7: 1, 13: 1, 14: field, 15: lang_code,
-                                   16: 2, 20: "2.131.22", 21: 1})
+                                   16: 2, 20: "1.132.1", 21: 1})
             url = major_register_url(region, is_ghost)
             register_headers = headers(url, "application/x-www-form-urlencoded", game=True)
             register_headers["Authorization"] = "Bearer"
@@ -1210,9 +1214,9 @@ async def Bmw(reg):
     body = json.dumps({"open_id": oid, "open_id_type": "4", "login_token": token, "orign_platform_type": "4"})
     pb = await QwE(body, FreeFire_pb2.LoginReq())
     enc = BmwNoiNoiBmvYasYas(G, F, pb)
-    url = "https://loginbp.ggpolarbear.com/MajorLogin"
+    url = "https://loginbp.ppmainecoonghj.com/MajorLogin"
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as cl:
-        res = await cl.post(url, data=enc, headers={'User-Agent': "Dalvik/2.1.0 (Linux; U; Android 13; CPH2095 Build/RKQ1.211119.001)", 'Connection': "Keep-Alive", 'Accept-Encoding': "gzip", 'Content-Type': "application/octet-stream", 'Expect': "100-continue", 'X-Unity-Version': "2018.4.11f1", 'X-GA': "v1 1", 'ReleaseVersion': "OB54"})
+        res = await cl.post(url, data=enc, headers={"Host": "loginbp.ggpolarbear.com", 'User-Agent': "Dalvik/2.1.0 (Linux; U; Android 13; CPH2095 Build/RKQ1.211119.001)", 'Connection': "Keep-Alive", 'Accept-Encoding': "gzip", 'Content-Type': "application/octet-stream", 'Expect': "100-continue", 'X-Unity-Version': "2018.4.11f1", 'X-GA': "v1 1", 'ReleaseVersion': "OB55"})
         res.raise_for_status()
         msg = json.loads(json_format.MessageToJson(PoI(res.content, FreeFire_pb2.LoginRes)))
         TOKENS[reg] = {
@@ -1253,7 +1257,7 @@ async def LoL(uid, unk, reg, ep):
     data_enc = BmwNoiNoiBmvYasYas(G, F, payload)
     token, lock, server = await RtY(reg)
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as cl:
-        res = await cl.post(server+ep, data=data_enc, headers={'User-Agent': "Dalvik/2.1.0 (Linux; U; Android 13; CPH2095 Build/RKQ1.211119.001)", 'Connection': "Keep-Alive", 'Accept-Encoding': "gzip", 'Content-Type': "application/octet-stream", 'Expect': "100-continue", 'Authorization': token, 'X-Unity-Version': "2018.4.11f1", 'X-GA': "v1 1", 'ReleaseVersion': "OB54"})
+        res = await cl.post(server+ep, data=data_enc, headers={'User-Agent': "Dalvik/2.1.0 (Linux; U; Android 13; CPH2095 Build/RKQ1.211119.001)", 'Connection': "Keep-Alive", 'Accept-Encoding': "gzip", 'Content-Type': "application/octet-stream", 'Expect': "100-continue", 'Authorization': token, 'X-Unity-Version': "2018.4.11f1", 'X-GA': "v1 1", 'ReleaseVersion': "OB55"})
         res.raise_for_status()
         return json.loads(json_format.MessageToJson(PoI(res.content, AccountPersonalShow_pb2.AccountPersonalShowInfo)))
 
@@ -1267,7 +1271,7 @@ def like_headers(token):
         "Expect": "100-continue",
         "X-Unity-Version": "2022.3.47f1",
         "X-GA": "v1 1",
-        "ReleaseVersion": "OB54",
+        "ReleaseVersion": "OB55",
     }
 
 def create_like_payload(uid, region):
@@ -1444,7 +1448,7 @@ def jwt_login():
         enc_data = BmwNoiNoiBmvYasYas(G, F, req_msg.SerializeToString())
         headers = {
             "X-GA": "v1 1",
-            "ReleaseVersion": "OB54",
+            "ReleaseVersion": "OB55",
             "Content-Type": "application/octet-stream",
             "User-Agent": USERAGENT,
             "Connection": "Keep-Alive",
@@ -1454,9 +1458,9 @@ def jwt_login():
         }
 
         resp = http_session.post(
-            "https://loginbp.ggpolarbear.com/MajorLogin",
+            "https://loginbp.ppmainecoonghj.com/MajorLogin",
             data=enc_data,
-            headers=headers,
+            headers={**headers, "Host": "loginbp.ggpolarbear.com"},
             verify=False,
             timeout=8
         )
