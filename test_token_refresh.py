@@ -267,5 +267,116 @@ class RefreshTests(unittest.TestCase):
         self.assertEqual(refresh.call_count, 2)
 
 
+class GuestGenerationTests(unittest.TestCase):
+    def setUp(self):
+        import requests
+        import hashlib
+        import hmac
+        import guest_protocol
+        from Crypto.Cipher import AES
+        from Crypto.Util.Padding import unpad
+        from google.protobuf import message
+        from urllib.parse import urlparse
+        self.requests = requests
+        tree = ast.parse(Path("lssj.py").read_text(encoding="utf-8-sig"))
+        node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "create_guest_account_with_proxy")
+        self.session = Mock()
+        context = Mock()
+        context.__enter__ = Mock(return_value=self.session)
+        context.__exit__ = Mock(return_value=False)
+        self.ns = dict(guest_protocol=guest_protocol, AES=AES, unpad=unpad, message=message, json=json, hashlib=hashlib, hmac=hmac, requests=SimpleNamespace(Session=Mock(return_value=context), RequestException=requests.RequestException),
+                       generate_custom_password=Mock(return_value="original-password"),
+                       generate_random_name=Mock(return_value="original-name"), normalize_region=lambda r: r.upper(),
+                       urlparse=urlparse, USERAGENT="agent", with_region_ip_headers=lambda h, r: h,
+                       response_json_or_text=lambda response: response.json(), CLIENT_SECRET="fake", CLIENT_ID="100067",
+                       REGION_LANG={"ME": "en"}, build_proto=Mock(return_value=b"payload"),
+                       major_register_url=lambda *a: "https://example.test/MajorRegister",
+                       major_login_url=lambda *a: "https://example.test/MajorLogin",
+                       BmwNoiNoiBmvYasYas=lambda g, f, data: data, G="", F="",
+                       build_major_login_request=Mock(return_value=SimpleNamespace(SerializeToString=lambda: b"login")),
+                       MajorLoginRes_pb2=SimpleNamespace(MajorLoginRes=Mock(return_value=Mock())),
+                       MessageToDict=lambda *a, **kw: {"token": "fake-jwt", "account_id": "123", "lock_region": "ME"},
+                       decode_jwt_payload=lambda token: {}, time=SimpleNamespace(sleep=Mock()))
+        exec(compile(ast.Module(body=[node], type_ignores=[]), "lssj.py", "exec"), self.ns)
+
+    def response(self, data=None, status=200):
+        result = Mock(status_code=status, content=b"protobuf")
+        result.json.return_value = data
+        if status >= 400:
+            result.raise_for_status.side_effect = self.requests.HTTPError(response=result)
+        return result
+
+    def run_guest(self, ghost=False):
+        return self.ns["create_guest_account_with_proxy"]("ME", "base", "prefix", ghost, "http://proxy.test")
+
+    def test_preserves_name_password_and_checks_new_register_fields(self):
+        self.session.post.side_effect = [self.response({"code": 0, "data": {"uid": "7"}}), self.response({"access_token": "access", "open_id": "open"}), self.response(), self.response()]
+        result = self.run_guest(True)
+        self.assertTrue(result["major_login_success"])
+        self.assertEqual((result["name"], result["password"]), ("original-name", "original-password"))
+        self.ns["generate_custom_password"].assert_called_once_with("prefix")
+        self.ns["generate_random_name"].assert_called_once_with("base")
+        fields = self.ns["build_proto"].call_args_list[0].args[0]
+        self.assertEqual((fields[1], fields[15], fields[16], fields[20]), ("original-name", "pt", 2, "2.131.22"))
+        self.session.proxies.update.assert_called_once()
+        login_fields = self.ns["build_proto"].call_args_list[1].args[0]
+        self.assertEqual((login_fields[7], login_fields[22], login_fields[26], login_fields[29]), ("2.131.22", "open", "BR", "access"))
+
+    def test_missing_token_fields_uses_fallback_endpoint(self):
+        self.session.post.side_effect = [self.response({"data": {"uid": "7"}}), self.response({}), self.response({"data": {"access_token": "access", "open_id": "open"}}), self.response(), self.response()]
+        self.assertTrue(self.run_guest()["major_login_success"])
+        self.assertIn("token:grant", self.session.post.call_args_list[2].args[0])
+
+    def test_registration_signature_matches_exact_sent_body(self):
+        import hashlib
+        import hmac
+        self.session.post.side_effect = [self.response({"data": {"uid": "7"}}), self.response({"access_token": "access", "open_id": "open"}), self.response(), self.response()]
+        self.assertTrue(self.run_guest()["major_login_success"])
+        request = self.session.post.call_args_list[0].kwargs
+        expected_body = b'{"app_id":100067,"client_type":2,"password":"original-password","source":2}'
+        self.assertEqual(request["data"], expected_body)
+        self.assertNotIn("json", request)
+        expected_signature = hmac.new(b"fake", expected_body, hashlib.sha256).hexdigest()
+        self.assertEqual(request["headers"]["Authorization"], "Signature " + expected_signature)
+
+    def test_reference_region_routes(self):
+        import guest_protocol
+        self.assertEqual(guest_protocol.region_host("SG"), "loginbp.ggpolarbear.com")
+        self.assertEqual(guest_protocol.region_host("ME"), "loginbp.common.ggbluefox.com")
+        self.assertEqual(guest_protocol.region_host("BR"), "loginbp.ggblueshark.com")
+        self.assertEqual(guest_protocol.region_host("SG", True), "loginbp.ggblueshark.com")
+
+    def test_encrypted_login_and_external_id_fallback(self):
+        from Crypto.Cipher import AES
+        from Crypto.Util.Padding import pad
+        self.ns["G"], self.ns["F"] = b"a" * 16, b"b" * 16
+        plaintext = b"simulated-protobuf"
+        response = self.response()
+        response.content = AES.new(self.ns["G"], AES.MODE_CBC, self.ns["F"]).encrypt(pad(plaintext, 16))
+        self.ns["MessageToDict"] = lambda *a, **kw: {"token": "fake-jwt"}
+        self.ns["decode_jwt_payload"] = lambda token: {"external_id": "123"}
+        self.session.post.side_effect = [self.response({"data": {"uid": "7"}}), self.response({"access_token": "access", "open_id": "open"}), self.response(), response]
+        result = self.run_guest()
+        self.assertTrue(result["major_login_success"])
+        self.assertEqual(result["account_id"], "123")
+        self.ns["MajorLoginRes_pb2"].MajorLoginRes.return_value.ParseFromString.assert_called_once_with(plaintext)
+
+    def test_major_register_failure_keeps_credentials_and_stops_login(self):
+        self.session.post.side_effect = [self.response({"data": {"uid": "7"}}), self.response({"access_token": "access", "open_id": "open"}), self.response(status=500)]
+        result = self.run_guest()
+        self.assertEqual(result["failed_stage"], "MajorRegister")
+        self.assertEqual(result["uid"], "7")
+        self.assertEqual(result["password"], "original-password")
+        self.assertFalse(result["major_login_success"])
+        self.assertEqual(self.session.post.call_count, 3)
+
+    def test_registration_timeout_does_not_repeat_registration_in_session(self):
+        self.session.post.side_effect = self.requests.Timeout()
+        result = self.run_guest()
+        self.assertFalse(result["guest_created"])
+        self.assertEqual(result["failed_stage"], "Guest register")
+        self.assertEqual(self.session.post.call_count, 1)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -4,6 +4,10 @@ import asyncio
 import time
 import httpx
 import json
+import hashlib
+import hmac
+import guest_protocol
+from Crypto.Util.Padding import unpad
 import threading
 import base64
 import requests
@@ -511,14 +515,10 @@ def generate_custom_password(user_prefix):
     return "MEAN" + ''.join(random.choice('0123456789ABCDEF') for _ in range(60))
 
 def major_register_url(region, is_ghost=False):
-    if is_ghost:
-        return "https://loginbp.ggblueshark.com/MajorRegister"
-    return "https://loginbp.ggblueshark.com/MajorRegister"
+    return f"https://{guest_protocol.region_host(region, is_ghost)}/MajorRegister"
 
 def major_login_url(region, is_ghost=False):
-    if is_ghost:
-        return "https://loginbp.ggblueshark.com/MajorLogin"
-    return "https://loginbp.ggblueshark.com/MajorLogin"
+    return f"https://{guest_protocol.region_host(region, is_ghost)}/MajorLogin"
 
 def get_region_proxies(region):
     candidates = get_region_proxy_candidates(region)
@@ -979,225 +979,169 @@ def create_guest_account(region, account_name, password_prefix, is_ghost=False):
     }
 
 def create_guest_account_with_proxy(region, account_name, password_prefix, is_ghost=False, proxy_url=None):
+    # Preserve the existing naming/password generators, including GHOST mode.
     password = generate_custom_password(password_prefix)
     region = normalize_region(region)
-    proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
-    register_headers = with_region_ip_headers({
-        "Accept": "application/json",
-        "Content-Type": "application/json; charset=utf-8",
-        "Accept-Encoding": "gzip",
-        "Connection": "Keep-Alive",
-        "Host": "100067.connect.garena.com",
-        "User-Agent": "GarenaMSDK/4.0.39(SM-A325M;Android 13;en;HK;)",
-    }, region)
-    register_response = http_session.post(
-        "https://100067.connect.garena.com/api/v2/oauth/guest:register",
-        headers=register_headers,
-        json={"app_id": 100067, "client_type": 2, "password": password, "source": 2},
-        timeout=15,
-        verify=False,
-        proxies=proxies,
-    )
-    if register_response.status_code != 200:
-        return {
-            "success": False,
-            "guest_created": False,
-            "uid": None,
-            "password": password,
-            "requested_region": region,
-            "error": f"Guest register failed with status {register_response.status_code}",
-            "details": register_response.text[:500],
-        }
-    register_data = response_json_or_text(register_response)
-    uid = register_data.get("data", {}).get("uid")
-    if not uid:
-        return {
-            "success": False,
-            "guest_created": False,
-            "uid": None,
-            "password": password,
-            "requested_region": region,
-            "error": "Guest register did not return uid",
-            "register_response": register_data,
-        }
-
-    token_form_headers = with_region_ip_headers({
-        "Accept-Encoding": "gzip",
-        "Connection": "Keep-Alive",
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Host": "100067.connect.garena.com",
-        "User-Agent": "GarenaMSDK/4.0.19P8(ASUS_Z01QD ;Android 12;en;US;)",
-    }, region)
-    token_form_payload = {
-        "uid": uid,
-        "password": password,
-        "response_type": "token",
-        "client_type": "2",
-        "client_secret": CLIENT_SECRET,
-        "client_id": CLIENT_ID,
-    }
-    token_response = None
-    token_attempts = [
-        {
-            "url": "https://100067.connect.garena.com/oauth/guest/token/grant",
-            "headers": token_form_headers,
-            "kwargs": {"data": token_form_payload},
-        },
-        {
-            "url": "https://100067.connect.garena.com/api/v2/oauth/guest/token:grant",
-            "headers": with_region_ip_headers({
-                "Accept": "application/json",
-                "Content-Type": "application/json; charset=utf-8",
-                "Accept-Encoding": "gzip",
-                "Connection": "Keep-Alive",
-                "Host": "100067.connect.garena.com",
-                "User-Agent": "GarenaMSDK/4.0.39(SM-A325M;Android 13;en;HK;)",
-            }, region),
-            "kwargs": {
-                "json": {
-                    "client_id": 100067,
-                    "client_secret": CLIENT_SECRET,
-                    "client_type": 2,
-                    "password": password,
-                    "response_type": "token",
-                    "uid": int(uid),
-                }
-            },
-        },
-    ]
-    token_errors = []
-    for attempt in token_attempts:
-        token_response = http_session.post(
-            attempt["url"],
-            headers=attempt["headers"],
-            timeout=15,
-            verify=False,
-            proxies=proxies,
-            **attempt["kwargs"],
-        )
-        if token_response.status_code == 200:
-            break
-        token_errors.append({
-            "url": attempt["url"],
-            "status_code": token_response.status_code,
-            "details": token_response.text[:300],
-        })
-    if token_response.status_code != 200:
-        return {
-            "success": True,
-            "guest_created": True,
-            "uid": uid,
-            "password": password,
-            "name": None,
-            "requested_region": "GHOST" if is_ghost else region,
-            "region": "GHOST" if is_ghost else region,
-            "access_token": None,
-            "account_id": None,
-            "jwt_token": None,
-            "warning": f"Guest created, but token grant failed with status {token_response.status_code}",
-            "details": token_response.text[:500],
-            "token_attempts": token_errors,
-        }
-    token_data = response_json_or_text(token_response)
-    if "data" in token_data and isinstance(token_data["data"], dict):
-        token_data = token_data["data"]
-    access_token = token_data.get("access_token")
-    open_id = token_data.get("open_id")
-    if not access_token or not open_id:
-        return {
-            "success": True,
-            "guest_created": True,
-            "uid": uid,
-            "password": password,
-            "name": None,
-            "requested_region": "GHOST" if is_ghost else region,
-            "region": "GHOST" if is_ghost else region,
-            "access_token": None,
-            "account_id": None,
-            "jwt_token": None,
-            "warning": "Guest created, but token grant did not return access_token/open_id",
-            "token_response": token_data,
-        }
-
-    keystream = [0x30,0x30,0x30,0x32,0x30,0x31,0x37,0x30,0x30,0x30,0x30,0x30,0x32,0x30,0x31,0x37,0x30,0x30,0x30,0x30,0x30,0x32,0x30,0x31,0x37,0x30,0x30,0x30,0x30,0x30,0x32,0x30]
-    encoded = ''.join(chr(ord(open_id[i]) ^ keystream[i % len(keystream)]) for i in range(len(open_id)))
-    field = codecs.decode(''.join(c if 32 <= ord(c) <= 126 else f'\\u{ord(c):04x}' for c in encoded), 'unicode_escape').encode('latin1')
-    name = generate_random_name(account_name)
-    lang_code = "pt" if is_ghost else REGION_LANG.get(region, "en")
-    payload = build_proto({1: name, 2: access_token, 3: open_id, 5: 102000007, 6: 4, 7: 1, 13: 1, 14: field, 15: lang_code, 16: 1, 17: 1})
-    reg_url = major_register_url(region, is_ghost)
-    major_register_headers = with_region_ip_headers({
-        "Accept-Encoding": "gzip",
-        "Authorization": "Bearer",
-        "Connection": "Keep-Alive",
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Expect": "100-continue",
-        "Host": reg_url.split('/')[2],
-        "ReleaseVersion": "OB54",
-        "X-GA": "v1 1",
-        "X-Unity-Version": "2018.4.11f1",
-        "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_I005DA Build/PI)",
-    }, region)
-    major_register_response = http_session.post(
-        reg_url,
-        headers=major_register_headers,
-        data=BmwNoiNoiBmvYasYas(G, F, payload),
-        timeout=15,
-        verify=False,
-        proxies=proxies,
-    )
-
-    req_msg = build_major_login_request(open_id, access_token)
-    login_url = major_login_url(region, is_ghost)
-    major_login_headers = with_region_ip_headers({
-        "X-GA": "v1 1",
-        "ReleaseVersion": "OB54",
-        "Content-Type": "application/octet-stream",
-        "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_I005DA Build/PI)",
-        "Connection": "Keep-Alive",
-        "Accept-Encoding": "gzip",
-        "Expect": "100-continue",
-        "X-Unity-Version": "2018.4.11f1",
-        "Host": login_url.split('/')[2],
-    }, region)
-    login_response = http_session.post(
-        login_url,
-        headers=major_login_headers,
-        data=BmwNoiNoiBmvYasYas(G, F, req_msg.SerializeToString()),
-        timeout=15,
-        verify=False,
-        proxies=proxies,
-    )
-
-    account_id = None
-    jwt_token = None
-    actual_region = None
-    major_login = {"status_code": login_response.status_code}
-    if login_response.status_code == 200 and login_response.content:
-        res_msg = MajorLoginRes_pb2.MajorLoginRes()
-        res_msg.ParseFromString(login_response.content)
-        major_login = MessageToDict(res_msg, preserving_proto_field_name=True)
-        account_id = major_login.get("account_id")
-        jwt_token = major_login.get("token")
-        actual_region = major_login.get("lock_region") or major_login.get("noti_region")
-
     requested_region = "GHOST" if is_ghost else region
-    response_region = normalize_region(actual_region) if actual_region else requested_region
-    return {
-        "success": True,
-        "guest_created": True,
-        "uid": uid,
-        "password": password,
-        "name": name,
-        "requested_region": requested_region,
-        "region": response_region,
-        "access_token": access_token,
-        "account_id": account_id,
-        "jwt_token": jwt_token,
-        "major_register_status": major_register_response.status_code,
-        "major_login_success": bool(account_id),
-        "major_login": major_login,
+    result = {
+        "success": False, "guest_created": False, "uid": None,
+        "password": password, "name": None, "requested_region": requested_region,
+        "region": requested_region, "access_token": None, "account_id": None,
+        "jwt_token": None, "major_login_success": False,
     }
+    stage = "Guest register"
+
+    def headers(url, content_type, game=False):
+        values = {
+            "Accept-Encoding": "gzip", "Connection": "Keep-Alive",
+            "Content-Type": content_type, "Host": urlparse(url).netloc,
+            "User-Agent": guest_protocol.random_ua(),
+        }
+        if game:
+            values.update({"ReleaseVersion": "OB54", "X-GA": "v1 1",
+                           "X-Unity-Version": "2022.3.47f1", "Expect": "100-continue"})
+        else:
+            values["Accept"] = "application/json"
+        return with_region_ip_headers(values, region)
+
+    with requests.Session() as session:
+        if proxy_url:
+            session.proxies.update({"http": proxy_url, "https": proxy_url})
+
+        def post(url, request_headers, retry=False, **kwargs):
+            # Registration may create an account even when its response is lost.
+            # Only token/login requests are retried automatically here.
+            for attempt in range(3 if retry else 1):
+                try:
+                    response = session.post(url, headers=request_headers, timeout=30,
+                                            verify=False, **kwargs)
+                    response.raise_for_status()
+                    return response
+                except requests.RequestException as exc:
+                    status = exc.response.status_code if exc.response is not None else None
+                    if not retry or attempt == 2 or (status is not None and status != 429 and status < 500):
+                        raise
+                    time.sleep(2 ** attempt)
+
+        try:
+            register_url = "https://100067.connect.garena.com/api/v2/oauth/guest:register"
+            register_payload = {"app_id": 100067, "client_type": 2, "password": password, "source": 2}
+            register_body = json.dumps(register_payload, separators=(',', ':')).encode("utf-8")
+            signature = hmac.new(CLIENT_SECRET.encode("utf-8"), register_body, hashlib.sha256).hexdigest()
+            register_headers = headers(register_url, "application/json; charset=utf-8")
+            register_headers["Authorization"] = f"Signature {signature}"
+            response = post(register_url, register_headers, data=register_body)
+            registration = response_json_or_text(response)
+            data = registration.get("data") if isinstance(registration, dict) else None
+            uid = data.get("uid") if isinstance(data, dict) else None
+            if not uid or registration.get("code", 0) != 0:
+                raise ValueError("Guest register did not return a successful UID")
+            result.update(success=True, guest_created=True, uid=uid)
+
+            stage = "Token grant"
+            form_url = "https://100067.connect.garena.com/oauth/guest/token/grant"
+            json_url = "https://100067.connect.garena.com/api/v2/oauth/guest/token:grant"
+            form = {"uid": uid, "password": password, "response_type": "token",
+                    "client_type": "2", "client_secret": CLIENT_SECRET, "client_id": CLIENT_ID}
+            attempts = [
+                (form_url, "application/x-www-form-urlencoded", {"data": form}),
+                (json_url, "application/json; charset=utf-8", {"json": {
+                    **form, "uid": int(uid), "client_type": 2, "client_id": 100067}}),
+            ]
+            access_token = open_id = None
+            last_error = None
+            for url, content_type, payload in attempts:
+                try:
+                    response = post(url, headers(url, content_type), retry=True, **payload)
+                    data = response_json_or_text(response)
+                    if isinstance(data, dict) and isinstance(data.get("data"), dict):
+                        data = data["data"]
+                    if not isinstance(data, dict) or not data.get("access_token") or not data.get("open_id"):
+                        raise ValueError("Token grant did not return access_token/open_id")
+                    access_token, open_id = data["access_token"], data["open_id"]
+                    break
+                except (requests.RequestException, ValueError) as exc:
+                    last_error = exc
+            if not access_token or not open_id:
+                raise last_error or ValueError("Token grant failed")
+            result["access_token"] = access_token
+
+            stage = "MajorRegister"
+            name = generate_random_name(account_name)
+            result["name"] = name
+            keystream = bytes([0x30,0x30,0x30,0x32,0x30,0x31,0x37,0x30,0x30,0x30,0x30,0x30,0x32,0x30,0x31,0x37,0x30,0x30,0x30,0x30,0x30,0x32,0x30,0x31,0x37,0x30,0x30,0x30,0x30,0x30,0x32,0x30])
+            field = bytes(ord(char) ^ keystream[index % len(keystream)] for index, char in enumerate(open_id))
+            lang_code = "pt" if is_ghost else guest_protocol.REGION_LANG.get(region, "en")
+            payload = build_proto({1: name, 2: access_token, 3: open_id, 5: 102000007,
+                                   6: 4, 7: 1, 13: 1, 14: field, 15: lang_code,
+                                   16: 2, 20: "2.131.22", 21: 1})
+            url = major_register_url(region, is_ghost)
+            register_headers = headers(url, "application/x-www-form-urlencoded", game=True)
+            register_headers["Authorization"] = "Bearer"
+            response = post(url, register_headers, data=BmwNoiNoiBmvYasYas(G, F, payload))
+            result["major_register_status"] = response.status_code
+
+            stage = "MajorLogin"
+            login_payload = build_proto(guest_protocol.login_fields(region, open_id, access_token, is_ghost))
+            url = major_login_url(region, is_ghost)
+            response = post(url, headers(url, "application/x-www-form-urlencoded", game=True), retry=True,
+                            data=BmwNoiNoiBmvYasYas(G, F, login_payload))
+            candidates = []
+            try:
+                candidates.append(unpad(AES.new(G, AES.MODE_CBC, F).decrypt(response.content), AES.block_size))
+            except ValueError:
+                pass
+            candidates.append(response.content)
+            login = {}
+            for content in candidates:
+                try:
+                    res_msg = MajorLoginRes_pb2.MajorLoginRes()
+                    res_msg.ParseFromString(content)
+                    candidate = MessageToDict(res_msg, preserving_proto_field_name=True)
+                    if candidate.get("token"):
+                        login = candidate
+                        break
+                except message.DecodeError:
+                    continue
+            jwt_token = login.get("token")
+            if not jwt_token:
+                raise ValueError("MajorLogin did not return a JWT")
+            jwt_data = decode_jwt_payload(jwt_token)
+            account_id = login.get("account_id") or jwt_data.get("account_id") or jwt_data.get("external_id")
+            if not account_id:
+                raise ValueError("MajorLogin did not return an account ID")
+            actual_region = login.get("lock_region") or login.get("noti_region")
+            result.update(account_id=account_id, jwt_token=jwt_token, major_login=login,
+                          major_login_success=True,
+                          region=normalize_region(actual_region) if actual_region else requested_region)
+            return result
+        except Exception as exc:
+            # Keep created credentials if a later stage fails; callers can recover them.
+            response = getattr(exc, "response", None)
+            reason = f"HTTP {response.status_code}" if response is not None else type(exc).__name__
+            if response is not None:
+                result["http_status"] = response.status_code
+                try:
+                    error_data = response.json()
+                    if isinstance(error_data, dict):
+                        # Expose only diagnostic fields, never raw credential-bearing responses.
+                        for field_name in ("code", "error", "message", "msg"):
+                            value = error_data.get(field_name)
+                            if isinstance(value, (str, int)):
+                                safe_value = str(value)[:300]
+                                for secret in (password, result.get("access_token"), result.get("jwt_token")):
+                                    if secret:
+                                        safe_value = safe_value.replace(str(secret), "[redacted]")
+                                result.setdefault("upstream_error", {})[field_name] = safe_value
+                except (ValueError, TypeError):
+                    pass
+            message = f"{stage} failed ({reason})"
+            if result["guest_created"]:
+                result["warning"] = "Guest created, but " + message
+            else:
+                result["error"] = message
+            result["failed_stage"] = stage
+            return result
 
 def PoI(b, mt):
     m = mt()
