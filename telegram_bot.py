@@ -1,4 +1,5 @@
 import logging
+import io
 import json
 import os
 import random
@@ -8,6 +9,8 @@ import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from guest_activation import activate_guest, parse_accounts
 from html import escape
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -2065,7 +2068,7 @@ def build_help_text(chat_id=None, user_id=None, active_bot=None, page="main"):
             "💎 AUTOLIKEFF OWNER",
             "━━━━━━━━━━━━━━━━━━",
             "🎟 /jwt <uid> <password> - Generate/check JWT token",
-            "✅ /atvguest <uid> <password> or <token> - Activate guest account",
+            "✅ /actguest <uid> <password> - Activate guest (or reply to a JSON file)",
             "🧾 /guestgen <region> <name> [total] - Create guest account(s)",
             "❤️ /autolike <uid> <total_likes> <telegram_user_id> - Create AutoLike order",
             "📋 /autolike ls - List AutoLike orders",
@@ -3412,31 +3415,50 @@ def guest_account_record(data):
     }
 
 
-def process_guestgen(message, region, name, total=None, file_mode=False):
-    status_msg = bot.send_message(message.chat.id, "⏳ Generating guest account...\n━━━━━━━━━━━━━━━━━━\nPlease wait.", parse_mode=None)
-    accounts = []
-    failures = []
-    total = total or 1
-    attempts = 0
-    max_attempts = max(total * 5, total + 5)
-
-    while len(accounts) < total and attempts < max_attempts:
-        attempts += 1
-        if total > 1:
-            bot.edit_message_text(
-                chat_id=status_msg.chat.id,
-                message_id=status_msg.message_id,
-                text=f"⏳ Generating guest accounts...\n━━━━━━━━━━━━━━━━━━\n📦 Progress: {len(accounts)}/{total}\n🔁 Attempt: {attempts}/{max_attempts}",
-                parse_mode=None,
-            )
-        data = call_api("createaccount", {"region": region, "name": name})
-        if data.get("success") and not data.get("error"):
-            if data.get("account_id") in (None, "", "null"):
-                failures.append("Generated account skipped because account_id is missing")
+def generate_and_activate_guest(region, name):
+    last_error = "Guest account generation failed"
+    for _ in range(5):
+        try:
+            data = call_api("createaccount", {"region": region, "name": name})
+            if not data.get("uid") or not data.get("password"):
+                last_error = data.get("error") or "Guest account generation failed"
                 continue
-            accounts.append(guest_account_record(data))
-        else:
-            failures.append(data.get("error") or data.get("warning") or "Guest account generation failed")
+            # Preserve created credentials even if activation fails; don't create
+            # a replacement account just because the activation server is down.
+            record = guest_account_record(data)
+            try:
+                activation = activate_guest(record["uid"], record["password"])
+            except Exception as exc:
+                activation = {"success": False, "error": f"Activation failed ({type(exc).__name__})"}
+            record["activated"] = bool(activation.get("success"))
+            if not record["activated"]:
+                record["activation_error"] = activation.get("error") or "Activation failed"
+            return record, None
+        except Exception as exc:
+            last_error = f"Guest generation failed ({type(exc).__name__})"
+    return None, last_error
+
+
+def process_guestgen(message, region, name, total=None, file_mode=False):
+    status_msg = bot.send_message(message.chat.id, "? Generating and activating guest accounts?", parse_mode=None)
+    accounts, failures = [], []
+    total = total or 1
+    last_update = time.monotonic()
+    with ThreadPoolExecutor(max_workers=min(3, total)) as pool:
+        jobs = [pool.submit(generate_and_activate_guest, region, name) for _ in range(total)]
+        for job in as_completed(jobs):
+            record, error = job.result()
+            if record is not None:
+                accounts.append(record)
+            else:
+                failures.append(error)
+            if time.monotonic() - last_update >= 10:
+                try:
+                    bot.edit_message_text(chat_id=status_msg.chat.id, message_id=status_msg.message_id,
+                        text=f"? Generating and activating guest accounts?\n?? Processed: {len(accounts) + len(failures)}/{total}\n? Activated: {sum(a['activated'] for a in accounts)}", parse_mode=None)
+                except Exception:
+                    logger.warning("Could not update guest generation progress")
+                last_update = time.monotonic()
 
     if not accounts:
         error_text = failures[0] if failures else "Guest account generation failed"
@@ -3450,6 +3472,7 @@ def process_guestgen(message, region, name, total=None, file_mode=False):
 
     if not file_mode:
         text = format_guestgen(accounts[0])
+        text += "\n\n" + ("? Guest activated" if accounts[0]["activated"] else "?? Activation failed. Credentials preserved; retry with /actguest.")
         bot.edit_message_text(chat_id=status_msg.chat.id, message_id=status_msg.message_id, text=text[:3900], parse_mode="HTML")
         extra = text[3900:]
         while extra:
@@ -3467,23 +3490,18 @@ def process_guestgen(message, region, name, total=None, file_mode=False):
         "generated_at": generated_at,
         "items": accounts,
     }
-    with open(filename, "w", encoding="utf-8") as guest_file:
-        json.dump(file_payload, guest_file, ensure_ascii=False, indent=2)
-
     caption = "\n".join([
-        "📄 Temporary Accounts File",
-        f"🌍 Region: {region}",
-        f"🔢 Accounts: {len(accounts)}",
-        f"👤 Generated by: {generated_by}",
-        f"⏰ Generated at: {generated_at}",
+        "?? Guest Accounts File", f"?? Region: {region}",
+        f"?? Generated: {len(accounts)}/{total}",
+        f"? Activated: {sum(account['activated'] for account in accounts)}",
+        f"?? Activation failed: {sum(not account['activated'] for account in accounts)}",
+        f"? Generation failed: {len(failures)}",
+        f"?? Generated by: {generated_by}", f"? Generated at: {generated_at}",
     ])
-    with open(filename, "rb") as guest_file:
+    with io.BytesIO(json.dumps(file_payload, ensure_ascii=False, indent=2).encode("utf-8")) as guest_file:
+        guest_file.name = filename
         bot.send_document(message.chat.id, guest_file, caption=caption)
     safe_delete(status_msg.chat.id, status_msg.message_id)
-    try:
-        os.remove(filename)
-    except OSError:
-        logger.warning("Could not remove temporary file %s", filename)
 
 
 @bot.message_handler(commands=["guestgen"])
@@ -3506,6 +3524,69 @@ def guestgen_command(message):
         total = int(args[3])
         file_mode = True
     threading.Thread(target=process_guestgen, args=(message, args[1].upper(), args[2], total, file_mode), daemon=True).start()
+
+
+def process_guest_activation(message, accounts=None, document=None):
+    active_bot = active_bot_for(message)
+    status = active_bot.reply_to(message, "⏳ Activating guest accounts…", parse_mode=None)
+    try:
+        if document is not None:
+            info = active_bot.get_file(document.file_id)
+            raw = active_bot.download_file(info.file_path)
+            if len(raw) > 5 * 1024 * 1024:
+                raise ValueError("JSON file must be 5 MB or smaller.")
+            accounts = parse_accounts(raw.decode("utf-8-sig"))
+        succeeded, failures = 0, []
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            jobs = [pool.submit(activate_guest, account["uid"], account["password"]) for account in accounts]
+            for job in as_completed(jobs):
+                result = job.result()
+                if result["success"]:
+                    succeeded += 1
+                else:
+                    failures.append(result)
+        lines = ["✅ GUEST ACTIVATION COMPLETE" if not failures else "⚠️ GUEST ACTIVATION COMPLETE",
+                 "━━━━━━━━━━━━━━━━━━", f"📦 Total: {len(accounts)}", f"✅ Activated: {succeeded}", f"❌ Failed: {len(failures)}"]
+        if len(accounts) == 1:
+            lines.append(f"🆔 UID: {accounts[0]['uid']}")
+        for item in failures[:15]:
+            lines.append(f"🆔 {item['uid']} · {item['error']}")
+        if len(failures) > 15:
+            lines.append(f"…and {len(failures) - 15} more failed accounts.")
+        text = "\n".join(lines)
+    except (ValueError, UnicodeError):
+        text = "❌ Invalid account JSON. Use a list of objects containing uid and password, without duplicate UIDs (maximum 10,000 accounts / 5 MB)."
+    except Exception as exc:
+        logger.warning("Guest activation interrupted: %s", type(exc).__name__)
+        text = "❌ Guest activation interrupted. Some accounts may have completed; check before retrying."
+    active_bot.edit_message_text(text=text[:3900], chat_id=status.chat.id, message_id=status.message_id, parse_mode=None)
+
+
+@bot.message_handler(commands=["actguest"])
+def actguest_command(message):
+    active_bot = active_bot_for(message)
+    if command_belongs_to_other_bot(message, active_bot):
+        return
+    if not is_owner(message.from_user.id):
+        active_bot.reply_to(message, "⛔ Owner only.", parse_mode=None)
+        return
+    parts = message.text.split()
+    reply = getattr(message, "reply_to_message", None)
+    document = getattr(reply, "document", None)
+    accounts = None
+    try:
+        if len(parts) == 3:
+            accounts = parse_accounts(json.dumps([{"uid": parts[1], "password": parts[2]}]))
+            document = None
+        elif len(parts) == 1 and document:
+            if (getattr(document, "file_size", 0) or 0) > 5 * 1024 * 1024:
+                raise ValueError("JSON file must be 5 MB or smaller.")
+        else:
+            raise ValueError("Use /actguest <uid> <password>, or reply to an account JSON file with /actguest.")
+    except ValueError as exc:
+        active_bot.reply_to(message, f"⚠️ {exc}", parse_mode=None)
+        return
+    threading.Thread(target=process_guest_activation, args=(message, accounts, document), daemon=True).start()
 
 
 def process_bio_update(message, params, bio, active_bot=None):
@@ -5069,6 +5150,7 @@ def register_user_bot_handlers():
         (["region"], region_command),
         (["myautolike"], myautolike_command),
         (["bio"], bio_command),
+        (["actguest"], actguest_command),
         (["slotusage"], slotusage_command),
         (["seller"], seller_command),
         (["autolikeff"], autolikeff_command),

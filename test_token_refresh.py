@@ -378,5 +378,115 @@ class GuestGenerationTests(unittest.TestCase):
         self.assertEqual(self.session.post.call_count, 1)
 
 
+class GuestActivationTests(unittest.TestCase):
+    def setUp(self):
+        import guest_activation
+        self.module = guest_activation
+        self.session = Mock()
+        self.context = patch.object(guest_activation.requests, "Session")
+        self.context.start().return_value.__enter__.return_value = self.session
+        self.addCleanup(self.context.stop)
+
+    def response(self, content=b"", data=None):
+        result = Mock(status_code=200, content=content)
+        result.json.return_value = data
+        return result
+
+    def configure(self, server="https://client.ind.freefiremobile.com", login_data=b"\x08\x01"):
+        login = bytes(self.module.create_proto({8: "fake-jwt", 10: server}))
+        self.session.post.side_effect = [self.response(data={"access_token": "access", "open_id": "open", "platform": 4}), self.response(login), self.response(login_data)]
+
+    def test_activation_requires_all_three_steps(self):
+        self.configure()
+        result = self.module.activate_guest("123", "secret")
+        self.assertTrue(result["success"])
+        self.assertEqual(self.session.post.call_count, 3)
+        call = self.session.post.call_args
+        self.assertEqual(call.args[0], "https://client.ind.freefiremobile.com/GetLoginData")
+        self.assertEqual(call.kwargs["headers"]["Authorization"], "Bearer fake-jwt")
+        self.assertNotIn("Host", call.kwargs["headers"])
+        self.assertNotIn("secret", str(result))
+
+    def test_no_login_data_is_not_success(self):
+        self.configure(login_data=b"")
+        self.assertFalse(self.module.activate_guest("123", "secret")["success"])
+
+    def test_untrusted_server_never_receives_token(self):
+        self.configure(server="https://example.org")
+        self.assertFalse(self.module.activate_guest("123", "secret")["success"])
+        self.assertEqual(self.session.post.call_count, 2)
+
+    def test_json_formats_and_duplicates(self):
+        account = {"uid": "123", "password": "secret"}
+        for data in ([account], {"accounts": [account]}, {"one": account}, account):
+            self.assertEqual(self.module.parse_accounts(json.dumps(data)), [account])
+        with self.assertRaises(ValueError):
+            self.module.parse_accounts(json.dumps([account, account]))
+        with self.assertRaises(ValueError):
+            self.module.decode_protobuf(b"\x42\x10short")
+
+    def test_guestgen_file_format_can_be_activated(self):
+        data = {"accounts": 1, "items": [{"uid": "123", "password": "secret", "activated": False}]}
+        self.assertEqual(self.module.parse_accounts(json.dumps(data)), [{"uid": "123", "password": "secret"}])
+
+    def test_guestgen_activates_created_account_without_replacing_on_failure(self):
+        tree = ast.parse(Path("telegram_bot.py").read_text(encoding="utf-8-sig"))
+        names = ("guest_account_record", "generate_and_activate_guest")
+        nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names]
+        api = Mock(return_value={"uid": "123", "password": "secret", "name": "original"})
+        activate = Mock(side_effect=RuntimeError("offline"))
+        ns = dict(call_api=api, activate_guest=activate)
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), "telegram_bot.py", "exec"), ns)
+        account, error = ns["generate_and_activate_guest"]("SG", "name")
+        self.assertIsNone(error)
+        self.assertEqual(account["uid"], "123")
+        self.assertFalse(account["activated"])
+        api.assert_called_once()
+        activate.assert_called_once_with("123", "secret")
+
+    def test_bulk_guestgen_three_workers_and_memory_output(self):
+        from concurrent.futures import as_completed
+        import time
+        from datetime import datetime
+        tree = ast.parse(Path("telegram_bot.py").read_text(encoding="utf-8-sig"))
+        node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "process_guestgen")
+        barrier = threading.Barrier(3)
+        def generate(region, name):
+            barrier.wait(timeout=5)
+            return {"uid": "123", "password": "secret", "activated": True}, None
+        bot = Mock()
+        bot.send_message.return_value = SimpleNamespace(chat=SimpleNamespace(id=1), message_id=2)
+        documents = []
+        bot.send_document.side_effect = lambda chat, document, **kwargs: documents.append(json.loads(document.read()))
+        ns = dict(bot=bot, ThreadPoolExecutor=ThreadPoolExecutor, as_completed=as_completed, generate_and_activate_guest=generate,
+                  time=time, logger=Mock(), datetime=datetime, json=json, io=io, safe_delete=Mock())
+        exec(compile(ast.Module(body=[node], type_ignores=[]), "telegram_bot.py", "exec"), ns)
+        message = SimpleNamespace(chat=SimpleNamespace(id=1), from_user=SimpleNamespace(first_name="Owner"))
+        ns["process_guestgen"](message, "SG", "name", 3, True)
+        self.assertEqual(len(documents[0]["items"]), 3)
+        self.assertTrue(all(a["activated"] for a in documents[0]["items"]))
+
+    def test_command_owner_only_and_both_input_modes(self):
+        tree = ast.parse(Path("telegram_bot.py").read_text(encoding="utf-8-sig"))
+        node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "actguest_command")
+        node.decorator_list = []
+        bot, worker, thread = Mock(), Mock(), Mock()
+        ns = dict(active_bot_for=lambda m: bot, command_belongs_to_other_bot=lambda *a: False,
+                  is_owner=lambda uid: uid == 1, parse_accounts=self.module.parse_accounts, json=json,
+                  threading=SimpleNamespace(Thread=thread), process_guest_activation=worker)
+        exec(compile(ast.Module(body=[node], type_ignores=[]), "telegram_bot.py", "exec"), ns)
+        message = SimpleNamespace(from_user=SimpleNamespace(id=2), text="/actguest 123 secret")
+        ns["actguest_command"](message)
+        thread.assert_not_called()
+        message.from_user.id = 1
+        ns["actguest_command"](message)
+        self.assertEqual(thread.call_args.kwargs["args"][1], [{"uid": "123", "password": "secret"}])
+        message.text = "/actguest"
+        document = SimpleNamespace(file_size=100, file_id="file")
+        message.reply_to_message = SimpleNamespace(document=document)
+        ns["actguest_command"](message)
+        self.assertIs(thread.call_args.kwargs["args"][2], document)
+
+
 if __name__ == "__main__":
     unittest.main()
