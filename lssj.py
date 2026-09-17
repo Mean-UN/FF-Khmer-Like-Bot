@@ -1167,9 +1167,14 @@ async def LoL(uid, unk, reg, ep):
 
 def like_headers(token):
     return {
-        "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
+        "User-Agent": "UnityPlayer/2018.4.12f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)",
+        "Connection": "Keep-Alive",
+        "Accept-Encoding": "gzip",
+        "X-GA-SV": str(int(time.time())),
         "Authorization": normalize_bearer_token(token),
         "Content-Type": "application/x-www-form-urlencoded",
+        "Expect": "100-continue",
+        "X-Unity-Version": "2018.4.12f1",
         "X-GA": "v1 1",
         "ReleaseVersion": jwt_protocol.RELEASE_VERSION,
     }
@@ -1181,7 +1186,7 @@ def like_server_url(region):
         return "https://client.ind.freefiremobile.com"
     if region in {"BR", "US", "SAC", "NA"}:
         return "https://client.us.freefiremobile.com"
-    return "https://clientbp.ggpolarbear.com"
+    return "https://clientbp.ppmainecoonghj.com"
 
 
 def create_like_payload(uid, region):
@@ -1252,7 +1257,7 @@ async def send_like_requests(uid, region, count=None, tokens=None):
         return await asyncio.gather(*tasks, return_exceptions=True)
 
 
-def summarize_like_results(results):
+def summarize_like_results(results, tokens=None):
     statuses = defaultdict(int)
     errors = defaultdict(int)
     for result in results:
@@ -1262,7 +1267,7 @@ def summarize_like_results(results):
             # Only expose exception categories, never request URLs or credentials.
             category = type(result).__name__ if isinstance(result, BaseException) else str(result)
             errors[category if category.isidentifier() else "RequestError"] += 1
-    return {
+    summary = {
         "attempted": len(results),
         "http_200": statuses.get("200", 0),
         "http_non_200": sum(count for status, count in statuses.items() if status != "200"),
@@ -1270,6 +1275,21 @@ def summarize_like_results(results):
         "http_status_counts": dict(statuses),
         "error_counts": dict(errors),
     }
+
+    if tokens is not None:
+        failed_tokens = []
+        for index, (token, result) in enumerate(zip(tokens, results), start=1):
+            if result == 200:
+                continue
+            normalized = normalize_bearer_token(token) or ""
+            raw_token = normalized.split(" ", 1)[-1]
+            failed_tokens.append({
+                "token_index": index,
+                "token_fingerprint": hashlib.sha256(raw_token.encode("utf-8")).hexdigest()[:16],
+                "http_status": result if isinstance(result, int) else None,
+            })
+        summary["failed_tokens"] = failed_tokens
+    return summary
 
 
 def get_like_account_info(data):
@@ -1468,7 +1488,7 @@ def run_like_api(token_file, endpoint_name, auto_slot=False):
             "slot": slot,
             "slot_new": slot_new,
             "tokens_used": len(like_tokens),
-            "send_results": summarize_like_results(results),
+            "send_results": summarize_like_results(results, like_tokens),
         }
 
         if auto_slot and slot:

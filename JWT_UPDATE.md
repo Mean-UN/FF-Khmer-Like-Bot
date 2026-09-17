@@ -50,9 +50,9 @@ Run `python -m unittest test_jwt_protocol test_token_refresh test_slot_integrati
 
 ## Like API reference update
 
-`/like` and `/likeff` now use the supplied like reference's Android 9 user agent and OB55 headers. The release value is shared with `jwt_protocol.RELEASE_VERSION`. Raw JWTs and already prefixed Bearer tokens are both accepted internally.
+`/like` and `/likeff` now use the latest supplied like reference's Unity 2018.4.12f1 user agent and OB55 headers. The release value is shared with `jwt_protocol.RELEASE_VERSION`. Raw JWTs and already prefixed Bearer tokens are both accepted internally.
 
-`like_server_url` selects the India host for IND, the US host for BR/US/SAC/NA, and `clientbp.ggpolarbear.com` for other supported regions. `fetch_like_info` and `send_like_requests` use saved JWTs directly; the existing regional-token login remains a fallback when no token is available.
+`like_server_url` selects the India host for IND, the US host for BR/US/SAC/NA, and `clientbp.ppmainecoonghj.com` for other supported regions. `fetch_like_info` and `send_like_requests` use saved JWTs directly; the existing regional-token login remains a fallback when no token is available.
 
 Existing encrypted protobuf payloads match the supplied like/profile request structure. Token files, API responses, slot handling and request accounting retain their existing behavior. Token refresh uses the local JWT protocol integrated above; the reference's external credential-taking JWT service is not required.
 
@@ -69,3 +69,5 @@ UID-only `/like` and `/likeff` requests read `regions.json` first. On a cache mi
 Both like routes now return `send_results` with `attempted`, `http_200`, `http_non_200`, `network_errors`, `http_status_counts`, and `error_counts`. This exposes rejected requests and timeouts that were previously discarded. Requests use one shared HTTP client and at most 25 concurrent sends. Every configured token is still attempted; a 220-token slot has 220 attempts. Failed sends are not automatically retried because the server may already have applied the request.
 
 A local audit found slot 1 contains 220 unique JWTs for 220 unique SG account IDs with future expiry claims. This does not establish server acceptance or account eligibility to add a like. Server-side limits and repeat-like behavior have not been verified.
+
+The latest function-by-function reference comparison is in `LIKE_REFERENCE_REVIEW.md`.
