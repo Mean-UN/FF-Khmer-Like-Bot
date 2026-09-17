@@ -4,6 +4,9 @@ import os
 import tempfile
 import time
 import random
+import threading
+import math
+from email.utils import parsedate_to_datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
@@ -16,6 +19,40 @@ FILE_SETS = {
     "like": ("uidpass.json", "tokens.json"),
     "likeff": ("uidpass_likeff.json", "tokens_likeff.json"),
 }
+
+_request_gate = threading.Lock()
+_next_request = 0.0
+_cooldown_until = 0.0
+
+
+class RefreshSession(requests.Session):
+    """Pace requests and share rate-limit cooldown across this slot's workers."""
+    def post(self, *args, **kwargs):
+        global _next_request, _cooldown_until
+        while True:
+            with _request_gate:
+                now = time.monotonic()
+                delay = max(_next_request, _cooldown_until) - now
+                if delay <= 0:
+                    _next_request = now + 0.2
+                    break
+            time.sleep(delay)
+        response = super().post(*args, **kwargs)
+        if response.status_code == 429:
+            raw = response.headers.get("Retry-After", "")
+            delay = 10.0
+            try:
+                seconds = float(raw)
+                if math.isfinite(seconds):
+                    delay = max(delay, seconds)
+            except (TypeError, ValueError):
+                try:
+                    delay = max(delay, parsedate_to_datetime(raw).timestamp() - time.time())
+                except (TypeError, ValueError, OverflowError):
+                    pass
+            with _request_gate:
+                _cooldown_until = max(_cooldown_until, time.monotonic() + delay)
+        return response
 
 
 def parse_args(argv):
@@ -50,7 +87,7 @@ def read_uidpass(uidpass_file):
 
 def fetch_jwt(uid, password):
     try:
-        with requests.Session() as session:
+        with RefreshSession() as session:
             for attempt in range(3):
                 try:
                     return lssj.fetch_guest_jwt_for_like_with_retry(uid, password, max_retries=1, session=session)
@@ -60,6 +97,8 @@ def fetch_jwt(uid, password):
                     delay = 2 ** (attempt + 1)
                     response = getattr(exc, "response", None)
                     if response is not None:
+                        if response.status_code in (400, 401, 403):
+                            raise
                         retry_after = response.headers.get("Retry-After", "")
                         if str(retry_after).isdigit():
                             delay = max(delay, min(60, int(retry_after)))
@@ -180,6 +219,7 @@ def main():
         except Exception as exc:
             response = getattr(exc, "response", None)
             reason = f"HTTP_{response.status_code}" if response is not None else type(exc).__name__
+            reason = f"{getattr(exc, 'refresh_stage', 'Refresh')}_{reason}"
             return None, {"uid": uid, "reason": reason}
 
     saved_tokens = {str(item.get("uid")): item for item in read_tokens(token_file)

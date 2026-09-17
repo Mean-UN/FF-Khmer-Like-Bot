@@ -102,5 +102,51 @@ def login_fields(region, open_id, access_token, is_ghost=False):
             102: b'C\x04AD\x07\r^Uf'
         }
 
+def refresh_login_fields(region, open_id, access_token):
+    """OB55 / 1.132.1 refresh layout from the supplied working capture.
+
+    Credentials, timestamp, language and generated device identifiers remain
+    dynamic; the captured account's credentials are never stored here.
+    """
+    fields = login_fields(region, open_id, access_token)
+    fields.pop(26, None)
+    fields.pop(96, None)
+    fields.update({
+        7: "1.132.1",
+        8: "Android OS 9 / API-28 (PI/rel.cjw.20220518.114133)",
+        10: "MTN/Spacetel",
+        12: 1280,
+        14: "240",
+        15: "x86-64 SSE3 SSE4.1 SSE4.2 AVX AVX2 | 2400 | 4",
+        16: 3942,
+        17: "Adreno (TM) 640",
+        18: "OpenGL ES 3.2",
+        25: "OnePlus A5010",
+        41: "MTN/Spacetel",
+        60: 46901,
+        61: 32794,
+        62: 2479,
+        63: 900,
+        64: 34727,
+        65: 46901,
+        66: 34727,
+        67: 46901,
+        73: 1,
+        74: "/data/app/com.dts.freefireth-fpXCSphIV6dKC7jL-WOyRA==/lib/arm",
+        77: "e62ab9354d8fb5fb081db338acb33491|/data/app/com.dts.freefireth-fpXCSphIV6dKC7jL-WOyRA==/base.apk",
+        79: 1,
+        81: "32",
+        83: "2019119026",
+        85: 3,
+        87: 255,
+        88: 4,
+        92: 16190,
+        94: "KqsHT8W93GdcG3ZozENfFwVHtm7qq1eRUNaIDNgRobozIBtLOiYCc4Y6zvvpcICxzQF2sOE4cbytwLs4xZbRnpRMpmWRQKmeO5vcs8nQYBhwqH7K",
+        98: 1,
+        102: bytes.fromhex("13521146500e590349510e460900115843395f005b510f685b560a6107576d0f0366"),
+    })
+    return fields
+
+
 def region_host(region, is_ghost=False):
     return REGION_HOSTS["GHOST"] if is_ghost else REGION_HOSTS.get(region.upper(), REGION_HOSTS["IND"])

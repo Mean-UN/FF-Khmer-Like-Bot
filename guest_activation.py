@@ -91,7 +91,7 @@ def _activate_guest_once(uid, password, region="IND"):
             payload = major_login_payload(access, open_id, int(data.get("platform") or 4), region)
             headers = {"X-Unity-Version": "2022.3.47f1", "ReleaseVersion": "OB55", "Content-Type": "application/x-www-form-urlencoded", "X-GA": "v1 1", "User-Agent": guest_protocol.random_ua(), "Connection": "Keep-Alive", "Accept-Encoding": "gzip"}
             stage = "MajorLogin"
-            response = session.post("https://loginbp.ppmainecoonghj.com/MajorLogin", data=payload, headers={**headers, "Host": "loginbp.ggpolarbear.com"}, timeout=30)
+            response = session.post("https://loginbp.ppmainecoonghj.com/MajorLogin", data=payload, headers={**headers, "Host": "loginbp.ggpolarbear.com", "Authorization": "Bearer " + access}, timeout=30)
             response.raise_for_status()
             candidates = []
             try:

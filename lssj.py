@@ -820,8 +820,17 @@ def assign_likeff_slot(uid):
 
 def fetch_guest_jwt_for_like(uid, password, session=None):
     session = session if session is not None else http_session
+    def post_stage(stage, url, **kwargs):
+        try:
+            response = session.post(url, **kwargs)
+            response.raise_for_status()
+            return response
+        except requests.RequestException as exc:
+            exc.refresh_stage = stage
+            raise
+
     uid_int = int(uid)
-    auth_response = session.post(
+    auth_response = post_stage("TokenGrant",
         "https://100067.connect.garena.com/api/v2/oauth/guest/token:grant",
         json={
             "client_id": 100067,
@@ -835,39 +844,59 @@ def fetch_guest_jwt_for_like(uid, password, session=None):
     )
     auth_response.raise_for_status()
     auth_data = response_json_or_text(auth_response)
-    inner = auth_data.get("data", {}) if isinstance(auth_data, dict) else {}
+    inner = auth_data.get("data", auth_data) if isinstance(auth_data, dict) else {}
+    if not isinstance(inner, dict):
+        inner = {}
     access_token = inner.get("access_token")
     open_id = inner.get("open_id")
     if not access_token or not open_id:
         raise ValueError("guest token grant did not return access_token/open_id")
 
-    req_msg = build_major_login_request(open_id, access_token)
-    login_response = session.post(
+    login_region = normalize_region(inner.get("region") or "IND")
+    login_fields = guest_protocol.refresh_login_fields(login_region, open_id, access_token)
+    platform = int(inner.get("platform") or 4)
+    login_fields.update({23: str(platform), 88: platform, 99: str(platform), 100: str(platform)})
+    login_response = post_stage("MajorLogin",
         "https://loginbp.ppmainecoonghj.com/MajorLogin",
-        data=BmwNoiNoiBmvYasYas(G, F, req_msg.SerializeToString()),
+        data=BmwNoiNoiBmvYasYas(G, F, build_proto(login_fields)),
         headers={
             "Host": "loginbp.ggpolarbear.com",
+            "Authorization": f"Bearer {access_token}",
             "X-GA": "v1 1",
             "ReleaseVersion": "OB55",
-            "Content-Type": "application/octet-stream",
+            "Content-Type": "application/x-www-form-urlencoded",
             "User-Agent": USERAGENT,
             "Connection": "Keep-Alive",
             "Accept-Encoding": "gzip",
             "Expect": "100-continue",
-            "X-Unity-Version": "2018.4.11f1",
+            "X-Unity-Version": "2022.3.47f1",
         },
         verify=False,
         timeout=15,
     )
     login_response.raise_for_status()
-    res_msg = MajorLoginRes_pb2.MajorLoginRes()
-    res_msg.ParseFromString(login_response.content)
-    major_login = MessageToDict(res_msg, preserving_proto_field_name=True)
+    candidates = []
+    try:
+        candidates.append(unpad(AES.new(G, AES.MODE_CBC, F).decrypt(login_response.content), AES.block_size))
+    except ValueError:
+        pass
+    candidates.append(login_response.content)
+    major_login = {}
+    for content in candidates:
+        try:
+            res_msg = MajorLoginRes_pb2.MajorLoginRes()
+            res_msg.ParseFromString(content)
+            candidate = MessageToDict(res_msg, preserving_proto_field_name=True)
+            if candidate.get("token"):
+                major_login = candidate
+                break
+        except message.DecodeError:
+            continue
     jwt_token = major_login.get("token")
     if not jwt_token:
         raise ValueError("MajorLogin did not return jwt token")
     jwt_payload = decode_jwt_payload(jwt_token)
-    account_id = major_login.get("account_id") or jwt_payload.get("account_id")
+    account_id = major_login.get("account_id") or jwt_payload.get("account_id") or jwt_payload.get("external_id")
     region = major_login.get("lock_region") or major_login.get("noti_region")
     return {
         "uid": str(uid),
@@ -1088,7 +1117,9 @@ def create_guest_account_with_proxy(region, account_name, password_prefix, is_gh
             stage = "MajorLogin"
             login_payload = build_proto(guest_protocol.login_fields(region, open_id, access_token, is_ghost))
             url = major_login_url(region, is_ghost)
-            response = post(url, headers(url, "application/x-www-form-urlencoded", game=True), retry=True,
+            login_headers = headers(url, "application/x-www-form-urlencoded", game=True)
+            login_headers["Authorization"] = f"Bearer {access_token}"
+            response = post(url, login_headers, retry=True,
                             data=BmwNoiNoiBmvYasYas(G, F, login_payload))
             candidates = []
             try:
@@ -1252,12 +1283,37 @@ async def RtY(reg):
     info = TOKENS[reg]
     return info['token'], info['region'], info['server']
 
+def player_info_url(region):
+    region = str(region or "").strip().upper()
+    if region == "IND":
+        host = "client.ind.freefiremobile.com"
+    elif region in {"BR", "US", "SAC", "NA"}:
+        host = "client.us.freefiremobile.com"
+    else:
+        host = "clientbp.ggpolarbear.com"
+    return f"https://{host}/GetPlayerPersonalShow"
+
+
+def player_info_headers(token):
+    token = str(token or "").strip()
+    if token.lower().startswith("bearer "):
+        token = token[7:].strip()
+    return {
+        "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "X-GA": "v1 1",
+        "ReleaseVersion": "OB55",
+    }
+
+
 async def LoL(uid, unk, reg, ep):
     payload = await QwE(json.dumps({'a': uid, 'b': unk}), main_pb2.GetPlayerPersonalShow())
     data_enc = BmwNoiNoiBmvYasYas(G, F, payload)
     token, lock, server = await RtY(reg)
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as cl:
-        res = await cl.post(server+ep, data=data_enc, headers={'User-Agent': "Dalvik/2.1.0 (Linux; U; Android 13; CPH2095 Build/RKQ1.211119.001)", 'Connection': "Keep-Alive", 'Accept-Encoding': "gzip", 'Content-Type': "application/octet-stream", 'Expect': "100-continue", 'Authorization': token, 'X-Unity-Version': "2018.4.11f1", 'X-GA': "v1 1", 'ReleaseVersion': "OB55"})
+    url = player_info_url(reg) if ep == "/GetPlayerPersonalShow" else server.rstrip("/") + ep
+    async with httpx.AsyncClient(timeout=10, verify=False) as cl:
+        res = await cl.post(url, data=data_enc, headers=player_info_headers(token))
         res.raise_for_status()
         return json.loads(json_format.MessageToJson(PoI(res.content, AccountPersonalShow_pb2.AccountPersonalShowInfo)))
 
@@ -1284,11 +1340,11 @@ def create_like_count_payload(uid):
     return BmwNoiNoiBmvYasYas(G, F, build_proto({1: int(uid), 2: 1}))
 
 async def fetch_like_info(uid, region, token=None):
-    region_token, lock, server = await RtY(region)
-    token = token or region_token
+    if not token:
+        token, _, _ = await RtY(region)
     payload = create_like_count_payload(uid)
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, verify=False) as cl:
-        res = await cl.post(server + "/GetPlayerPersonalShow", data=payload, headers=like_headers(token))
+    async with httpx.AsyncClient(timeout=10, verify=False) as cl:
+        res = await cl.post(player_info_url(region), data=payload, headers=player_info_headers(token))
         res.raise_for_status()
     info = PoI(res.content, like_count_pb2.Info)
     return json.loads(json_format.MessageToJson(info))

@@ -4,7 +4,10 @@ The seven-hour automatic cycle refreshes three token sets/slots concurrently.
 Each updater refreshes four accounts concurrently, with its own HTTP session
 per account and up to three attempts, waiting two and then four seconds
 between failed attempts, plus random jitter to spread retries. Numeric
-Retry-After responses increase the delay up to 60 seconds. After the first
+Retry-After responses extend a shared cooldown within each slot, accepting
+seconds or an HTTP date. Requests within a slot start at least 0.2 seconds
+apart; waiting workers recheck the cooldown before sending. HTTP 400/401/403
+skip immediate retries and receive only the later recovery attempt. After the first
 pass, failed accounts get one recovery pass after a 15–18 second cooldown,
 using two workers per slot. Successful accounts are not retried. The recovery
 pass permits up to three further attempts per failed account. Actual duration depends on upstream
@@ -30,7 +33,12 @@ reading accounts and emitting any progress, counts remain unavailable.
 Slots with token files but missing credentials are checked and reported too.
 The bot must remain running and the owner must allow private messages from it.
 Remaining account failures log aggregate error categories (for example,
-HTTP_429 or Timeout), without passwords, tokens, or raw server responses.
+TokenGrant_HTTP_429 or MajorLogin_HTTP_400), without passwords, tokens, or raw server responses.
+Refresh MajorLogin uses the supplied OB55 / 1.132.1 capture layout through
+guest_protocol.refresh_login_fields, OB55 headers, and Bearer authorization.
+Account credentials and timestamp remain dynamic, as do language and generated
+device identifiers. Guest creation retains its separate payload builder.
+Both encrypted and plain protobuf responses are supported.
 The compact Telegram report counts only failures remaining after recovery.
 If the process stops after Telegram accepts a message but before acknowledging
 it in SQLite, a duplicate notification can occur on restart.

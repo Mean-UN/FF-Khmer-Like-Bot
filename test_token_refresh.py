@@ -18,6 +18,56 @@ from token_refresh_alerts import TokenRefreshAlerts, failure_report, refresh_all
 
 
 class RefreshTests(unittest.TestCase):
+    def test_refresh_capture_layout_keeps_account_values_dynamic(self):
+        import guest_protocol
+        with patch.object(guest_protocol.time, "strftime", return_value="2026-09-17 04:00:00"):
+            fields = guest_protocol.refresh_login_fields("SG", "test-open-id", "test-access-token")
+        self.assertEqual(fields[3], "2026-09-17 04:00:00")
+        self.assertEqual(fields[7], "1.132.1")
+        self.assertEqual(fields[22], "test-open-id")
+        self.assertEqual(fields[29], "test-access-token")
+        self.assertEqual(fields[21], "en")
+        self.assertNotIn(26, fields)
+        self.assertNotIn(96, fields)
+        self.assertEqual(fields[63], 900)
+        self.assertEqual(fields[85], 3)
+        self.assertEqual(fields[98], 1)
+        self.assertIsInstance(fields[102], bytes)
+        self.assertEqual(len(fields[102]), 34)
+
+    def test_direct_refresh_auth_headers_and_response_formats(self):
+        from Crypto.Cipher import AES
+        from Crypto.Util.Padding import pad, unpad
+        from google.protobuf import message
+        from google.protobuf.json_format import MessageToDict
+        from proto import MajorLoginRes_pb2
+        tree = ast.parse(Path("lssj.py").read_text(encoding="utf-8-sig"))
+        node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "fetch_guest_jwt_for_like")
+        key, iv = b"a" * 16, b"b" * 16
+        import requests
+        import guest_protocol
+        ns = dict(guest_protocol=guest_protocol, normalize_region=lambda r: r, build_proto=lambda fields: b"request", requests=requests, CLIENT_SECRET="fake", USERAGENT="agent", response_json_or_text=lambda r: r.json(),
+                  build_major_login_request=lambda *a: SimpleNamespace(SerializeToString=lambda: b"request"),
+                  BmwNoiNoiBmvYasYas=lambda *a: b"encrypted-request", G=key, F=iv,
+                  AES=AES, unpad=unpad, message=message, MajorLoginRes_pb2=MajorLoginRes_pb2,
+                  MessageToDict=MessageToDict, decode_jwt_payload=lambda t: {"external_id": "123"},
+                  extract_nickname_from_jwt=lambda t: "name")
+        exec(compile(ast.Module(body=[node], type_ignores=[]), "lssj.py", "exec"), ns)
+        plain = MajorLoginRes_pb2.MajorLoginRes(token="fake-jwt").SerializeToString()
+        for nested in (False, True):
+            for encrypted in (False, True):
+                with self.subTest(nested=nested, encrypted=encrypted):
+                    grant = {"access_token": "access", "open_id": "open"}
+                    auth = Mock()
+                    auth.json.return_value = {"data": grant} if nested else grant
+                    login = Mock(content=AES.new(key, AES.MODE_CBC, iv).encrypt(pad(plain, 16)) if encrypted else plain)
+                    session = Mock()
+                    session.post.side_effect = [auth, login]
+                    result = ns["fetch_guest_jwt_for_like"]("7", "secret", session=session)
+                    self.assertEqual(result["token"], "fake-jwt")
+                    self.assertEqual(result["account_id"], "123")
+                    self.assertEqual(session.post.call_args.kwargs["headers"]["Authorization"], "Bearer access")
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -103,6 +153,50 @@ class RefreshTests(unittest.TestCase):
         module.FILE_SETS = {"like": (str(Path(self.temp.name) / "accounts.json"), str(Path(self.temp.name) / "tokens.json"))}
         return module
 
+    def test_request_spacing_and_shared_rate_limit_cooldown(self):
+        module = self.load_updater()
+        clock = [100.0]
+        starts = []
+        responses = [Mock(status_code=429, headers={"Retry-After": "20"}),
+                     Mock(status_code=200), Mock(status_code=200)]
+        def send(*args, **kwargs):
+            starts.append(clock[0])
+            return responses.pop(0)
+        def sleep(delay):
+            clock[0] += delay
+        with patch.object(module.time, "monotonic", side_effect=lambda: clock[0]), patch.object(module.time, "sleep", side_effect=sleep), patch.object(module.requests.Session, "post", side_effect=send):
+            with module.RefreshSession() as first, module.RefreshSession() as second:
+                first.post("https://example.invalid")
+                second.post("https://example.invalid")
+                first.post("https://example.invalid")
+        self.assertEqual(starts[:2], [100.0, 120.0])
+        self.assertAlmostEqual(starts[2], 120.2)
+
+    def test_waiting_request_rechecks_new_cooldown(self):
+        module = self.load_updater()
+        clock = [100.0]
+        module._next_request = 100.2
+        sleeps = []
+        def sleep(delay):
+            sleeps.append(delay)
+            clock[0] += delay
+            if len(sleeps) == 1:
+                module._cooldown_until = 120.0
+        with patch.object(module.time, "monotonic", side_effect=lambda: clock[0]), patch.object(module.time, "sleep", side_effect=sleep), patch.object(module.requests.Session, "post", return_value=Mock(status_code=200)):
+            with module.RefreshSession() as session:
+                session.post("https://example.invalid")
+        self.assertEqual(clock[0], 120.0)
+        self.assertEqual(len(sleeps), 2)
+
+    def test_bad_request_has_no_immediate_retry(self):
+        module = self.load_updater()
+        error = module.requests.HTTPError(response=Mock(status_code=400, headers={}))
+        module.lssj.fetch_guest_jwt_for_like_with_retry = Mock(side_effect=error)
+        with patch.object(module, "RefreshSession"):
+            with self.assertRaises(module.requests.HTTPError):
+                module.fetch_jwt("1", "secret")
+        self.assertEqual(module.lssj.fetch_guest_jwt_for_like_with_retry.call_count, 1)
+
     def test_accounts_parallel_deduplicated_and_failures_counted(self):
         module = self.load_updater()
         accounts = [{"uid": str(i), "password": "secret"} for i in range(1, 5)]
@@ -186,14 +280,14 @@ class RefreshTests(unittest.TestCase):
     def test_refresh_uses_isolated_session_and_three_attempts(self):
         module = self.load_updater()
         module.lssj.fetch_guest_jwt_for_like_with_retry = Mock(return_value={"token": "fake"})
-        with patch.object(module.requests, "Session") as session:
+        with patch.object(module, "RefreshSession") as session:
             self.assertEqual(module.fetch_jwt("1", "secret"), {"token": "fake"})
             module.lssj.fetch_guest_jwt_for_like_with_retry.assert_called_once_with("1", "secret", max_retries=1, session=session.return_value.__enter__.return_value)
 
     def test_retry_backoff_stops_after_success(self):
         module = self.load_updater()
         fetch = module.lssj.fetch_guest_jwt_for_like_with_retry = Mock(side_effect=[RuntimeError(), {"token": "ok"}])
-        with patch.object(module.requests, "Session"), patch.object(module.time, "sleep") as sleep:
+        with patch.object(module, "RefreshSession"), patch.object(module.time, "sleep") as sleep:
             self.assertEqual(module.fetch_jwt("1", "secret"), {"token": "ok"})
         self.assertEqual(fetch.call_count, 2)
         sleep.assert_called_once()
@@ -222,7 +316,7 @@ class RefreshTests(unittest.TestCase):
         response = SimpleNamespace(status_code=429, headers={"Retry-After": "20"})
         error = module.requests.HTTPError("rate limited", response=response)
         module.lssj.fetch_guest_jwt_for_like_with_retry = Mock(side_effect=[error, {"token": "ok"}])
-        with patch.object(module.requests, "Session"), patch.object(module.time, "sleep") as sleep:
+        with patch.object(module, "RefreshSession"), patch.object(module.time, "sleep") as sleep:
             module.fetch_jwt("1", "fake")
         self.assertGreaterEqual(sleep.call_args.args[0], 20)
         self.assertLessEqual(sleep.call_args.args[0], 21)
@@ -319,6 +413,7 @@ class GuestGenerationTests(unittest.TestCase):
         fields = self.ns["build_proto"].call_args_list[0].args[0]
         self.assertEqual((fields[1], fields[15], fields[16], fields[20]), ("original-name", "pt", 2, "1.132.1"))
         self.session.proxies.update.assert_called_once()
+        self.assertEqual(self.session.post.call_args_list[-1].kwargs["headers"]["Authorization"], "Bearer access")
         login_fields = self.ns["build_proto"].call_args_list[1].args[0]
         self.assertEqual((login_fields[7], login_fields[22], login_fields[26], login_fields[29]), ("1.132.3", "open", "BR", "access"))
 
@@ -402,6 +497,7 @@ class GuestActivationTests(unittest.TestCase):
         self.assertTrue(result["success"])
         self.assertEqual(self.session.post.call_count, 3)
         call = self.session.post.call_args
+        self.assertEqual(self.session.post.call_args_list[1].kwargs["headers"]["Authorization"], "Bearer access")
         self.assertEqual(call.args[0], "https://client.ind.freefiremobile.com/GetLoginData")
         self.assertEqual(call.kwargs["headers"]["Authorization"], "Bearer fake-jwt")
         self.assertNotIn("Host", call.kwargs["headers"])
