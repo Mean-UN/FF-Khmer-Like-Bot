@@ -7,6 +7,7 @@ import json
 import hashlib
 import hmac
 import guest_protocol
+import jwt_protocol
 from Crypto.Util.Padding import unpad
 import threading
 import base64
@@ -422,64 +423,7 @@ def convert_timestamps_to_human(data):
     return data
 
 def build_major_login_request(open_id, access_token):
-    req_msg = MajorLoginReq_pb2.MajorLogin()
-    req_msg.event_time = str(int(time.time()))
-    req_msg.game_name = "free fire"
-    req_msg.platform_id = 1
-    req_msg.client_version = "1.132.3"
-    req_msg.system_software = "Android OS 13 / API-33"
-    req_msg.system_hardware = "CPH2095"
-    req_msg.telecom_operator = "N/A"
-    req_msg.network_type = "WIFI"
-    req_msg.screen_width = 1080
-    req_msg.screen_height = 2400
-    req_msg.screen_dpi = "480"
-    req_msg.processor_details = "ARMv8"
-    req_msg.memory = 4096
-    req_msg.gpu_renderer = "Adreno (TM) 610"
-    req_msg.gpu_version = "OpenGL ES 3.2"
-    req_msg.unique_device_id = "2f6f0d08-3c2b-4f9f-9d2f-1f2c4a5b6c7d"
-    req_msg.client_ip = "0.0.0.0"
-    req_msg.language = "en"
-    req_msg.open_id = open_id
-    req_msg.open_id_type = "4"
-    req_msg.device_type = "android"
-    req_msg.memory_available.version = 1
-    req_msg.memory_available.hidden_value = 0
-    req_msg.access_token = access_token
-    req_msg.platform_sdk_id = 1
-    req_msg.network_operator_a = "N/A"
-    req_msg.network_type_a = "WIFI"
-    req_msg.client_using_version = "1.132.1"
-    req_msg.external_storage_total = 64000
-    req_msg.external_storage_available = 32000
-    req_msg.internal_storage_total = 64000
-    req_msg.internal_storage_available = 32000
-    req_msg.game_disk_storage_available = 32000
-    req_msg.game_disk_storage_total = 64000
-    req_msg.external_sdcard_avail_storage = 0
-    req_msg.external_sdcard_total_storage = 0
-    req_msg.login_by = 3
-    req_msg.library_path = "/data/app/com.dts.freefireth/lib/arm64"
-    req_msg.reg_avatar = 1
-    req_msg.library_token = ""
-    req_msg.channel_type = 3
-    req_msg.cpu_type = 2
-    req_msg.cpu_architecture = "arm64-v8a"
-    req_msg.client_version_code = "OB55"
-    req_msg.graphics_api = "OpenGLES2"
-    req_msg.supported_astc_bitset = 0
-    req_msg.login_open_id_type = 4
-    req_msg.analytics_detail = b""
-    req_msg.loading_time = 0
-    req_msg.release_channel = "android"
-    req_msg.extra_info = ""
-    req_msg.android_engine_init_flag = 1
-    req_msg.if_push = 1
-    req_msg.is_vpn = 0
-    req_msg.origin_platform_type = "4"
-    req_msg.primary_platform_type = "4"
-    return req_msg
+    return jwt_protocol.build_major_login_request(open_id, access_token)
 
 def encode_varint(value):
     result = b''
@@ -820,55 +764,14 @@ def assign_likeff_slot(uid):
 
 def fetch_guest_jwt_for_like(uid, password, session=None):
     session = session if session is not None else http_session
-    uid_int = int(uid)
-    auth_response = session.post(
-        "https://100067.connect.garena.com/api/v2/oauth/guest/token:grant",
-        json={
-            "client_id": 100067,
-            "client_secret": CLIENT_SECRET,
-            "client_type": 2,
-            "password": password,
-            "response_type": "token",
-            "uid": uid_int,
-        },
-        timeout=15,
-    )
-    auth_response.raise_for_status()
-    auth_data = response_json_or_text(auth_response)
-    inner = auth_data.get("data", {}) if isinstance(auth_data, dict) else {}
-    access_token = inner.get("access_token")
-    open_id = inner.get("open_id")
-    if not access_token or not open_id:
-        raise ValueError("guest token grant did not return access_token/open_id")
-
-    req_msg = build_major_login_request(open_id, access_token)
-    login_response = session.post(
-        "https://loginbp.ppmainecoonghj.com/MajorLogin",
-        data=BmwNoiNoiBmvYasYas(G, F, req_msg.SerializeToString()),
-        headers={
-            "Host": "loginbp.ggpolarbear.com",
-            "X-GA": "v1 1",
-            "ReleaseVersion": "OB55",
-            "Content-Type": "application/octet-stream",
-            "User-Agent": USERAGENT,
-            "Connection": "Keep-Alive",
-            "Accept-Encoding": "gzip",
-            "Expect": "100-continue",
-            "X-Unity-Version": "2018.4.11f1",
-        },
-        verify=False,
-        timeout=15,
-    )
-    login_response.raise_for_status()
-    res_msg = MajorLoginRes_pb2.MajorLoginRes()
-    res_msg.ParseFromString(login_response.content)
-    major_login = MessageToDict(res_msg, preserving_proto_field_name=True)
+    _, open_id, access_token = jwt_protocol.generate_access_token(session, uid, password, CLIENT_SECRET)
+    major_login = jwt_protocol.major_login(session, open_id, access_token)
     jwt_token = major_login.get("token")
     if not jwt_token:
         raise ValueError("MajorLogin did not return jwt token")
     jwt_payload = decode_jwt_payload(jwt_token)
     account_id = major_login.get("account_id") or jwt_payload.get("account_id")
-    region = major_login.get("lock_region") or major_login.get("noti_region")
+    region = major_login.get("lock_region") or major_login.get("noti_region") or jwt_payload.get("lock_region")
     return {
         "uid": str(uid),
         "account_id": account_id,
@@ -1209,22 +1112,23 @@ async def guest_to_access_token(uid, password):
         return {"success": False, "uid": uid, "error": str(e)}
 
 async def Bmw(reg):
-    acc = AsD(reg)
-    token, oid = await ZxV(acc)
-    body = json.dumps({"open_id": oid, "open_id_type": "4", "login_token": token, "orign_platform_type": "4"})
-    pb = await QwE(body, FreeFire_pb2.LoginReq())
-    enc = BmwNoiNoiBmvYasYas(G, F, pb)
-    url = "https://loginbp.ppmainecoonghj.com/MajorLogin"
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as cl:
-        res = await cl.post(url, data=enc, headers={"Host": "loginbp.ggpolarbear.com", 'User-Agent': "Dalvik/2.1.0 (Linux; U; Android 13; CPH2095 Build/RKQ1.211119.001)", 'Connection': "Keep-Alive", 'Accept-Encoding': "gzip", 'Content-Type': "application/octet-stream", 'Expect': "100-continue", 'X-Unity-Version': "2018.4.11f1", 'X-GA': "v1 1", 'ReleaseVersion': "OB55"})
-        res.raise_for_status()
-        msg = json.loads(json_format.MessageToJson(PoI(res.content, FreeFire_pb2.LoginRes)))
-        TOKENS[reg] = {
-            'token': f"Bearer {msg.get('token','0')}",
-            'region': msg.get('lockRegion','0'),
-            'server': msg.get('serverUrl','0'),
-            'expires': time.time() + 25200
-        }
+    credentials = parse_qs(AsD(reg))
+
+    def login():
+        with requests.Session() as session:
+            _, open_id, access_token = jwt_protocol.generate_access_token(
+                session, credentials["uid"][0], credentials["password"][0], CLIENT_SECRET)
+            return jwt_protocol.major_login(session, open_id, access_token)
+
+    msg = await asyncio.to_thread(login)
+    if not msg.get("token") or not msg.get("server_url"):
+        raise ValueError("Regional login did not return token/server_url")
+    TOKENS[reg] = {
+        "token": normalize_bearer_token(msg["token"]),
+        "region": msg.get("lock_region") or reg,
+        "server": msg["server_url"].rstrip("/"),
+        "expires": time.time() + min(int(msg.get("ttl") or 25200), 25200),
+    }
 
 async def GaY():
     tasks = [Bmw(reg) for reg in REGNS]
@@ -1257,22 +1161,28 @@ async def LoL(uid, unk, reg, ep):
     data_enc = BmwNoiNoiBmvYasYas(G, F, payload)
     token, lock, server = await RtY(reg)
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as cl:
-        res = await cl.post(server+ep, data=data_enc, headers={'User-Agent': "Dalvik/2.1.0 (Linux; U; Android 13; CPH2095 Build/RKQ1.211119.001)", 'Connection': "Keep-Alive", 'Accept-Encoding': "gzip", 'Content-Type': "application/octet-stream", 'Expect': "100-continue", 'Authorization': token, 'X-Unity-Version': "2018.4.11f1", 'X-GA': "v1 1", 'ReleaseVersion': "OB55"})
+        res = await cl.post(server+ep, data=data_enc, headers={'User-Agent': "Dalvik/2.1.0 (Linux; U; Android 13; CPH2095 Build/RKQ1.211119.001)", 'Connection': "Keep-Alive", 'Accept-Encoding': "gzip", 'Content-Type': "application/octet-stream", 'Expect': "100-continue", 'Authorization': token, 'X-Unity-Version': "2018.4.11f1", 'X-GA': "v1 1", 'ReleaseVersion': jwt_protocol.RELEASE_VERSION})
         res.raise_for_status()
         return json.loads(json_format.MessageToJson(PoI(res.content, AccountPersonalShow_pb2.AccountPersonalShowInfo)))
 
 def like_headers(token):
     return {
-        "User-Agent": "UnityPlayer/2022.3.47f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)",
-        "Connection": "Keep-Alive",
-        "Accept-Encoding": "gzip",
-        "Authorization": token,
+        "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
+        "Authorization": normalize_bearer_token(token),
         "Content-Type": "application/x-www-form-urlencoded",
-        "Expect": "100-continue",
-        "X-Unity-Version": "2022.3.47f1",
         "X-GA": "v1 1",
-        "ReleaseVersion": "OB55",
+        "ReleaseVersion": jwt_protocol.RELEASE_VERSION,
     }
+
+
+def like_server_url(region):
+    region = region.upper()
+    if region == "IND":
+        return "https://client.ind.freefiremobile.com"
+    if region in {"BR", "US", "SAC", "NA"}:
+        return "https://client.us.freefiremobile.com"
+    return "https://clientbp.ggpolarbear.com"
+
 
 def create_like_payload(uid, region):
     msg = like_pb2.like()
@@ -1284,8 +1194,9 @@ def create_like_count_payload(uid):
     return BmwNoiNoiBmvYasYas(G, F, build_proto({1: int(uid), 2: 1}))
 
 async def fetch_like_info(uid, region, token=None):
-    region_token, lock, server = await RtY(region)
-    token = token or region_token
+    server = like_server_url(region)
+    if not token:
+        token, _, _ = await RtY(region)
     payload = create_like_count_payload(uid)
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, verify=False) as cl:
         res = await cl.post(server + "/GetPlayerPersonalShow", data=payload, headers=like_headers(token))
@@ -1320,8 +1231,10 @@ async def send_like_request(payload, token, url):
         return str(e)
 
 async def send_like_requests(uid, region, count=None, tokens=None):
-    region_token, lock, server = await RtY(region)
-    tokens = tokens or [region_token]
+    server = like_server_url(region)
+    if not tokens:
+        region_token, _, _ = await RtY(region)
+        tokens = [region_token]
     count = count or len(tokens)
     payload = create_like_payload(uid, region)
     url = server + "/LikeProfile"
@@ -1392,90 +1305,29 @@ def not_found(_):
         ]
     }), 404
 
-@FAHHHH.route('/jwt', methods=['GET'])
+@FAHHHH.route('/jwt', methods=['GET', 'POST'])
 def jwt_login():
-    uid = request.args.get('uid')
-    pw = request.args.get('pw')
-
-    if not uid or not pw:
-        return jsonify({
-            "status": "error",
-            "message": "Missing parameters. Use /jwt?uid=xxx&pw=xxx"
-        }), 400
-
+    body = request.get_json(silent=True)
+    params = body if isinstance(body, dict) else request.form
+    uid = params.get('uid') or request.args.get('uid')
+    pw = params.get('pw') or params.get('password') or request.args.get('pw') or request.args.get('password')
+    access_token = params.get('access_token') or request.args.get('access_token')
+    if not access_token and (not uid or not pw):
+        return jsonify({"status": "error", "message": "Provide uid and pw, or access_token"}), 400
+    if not access_token and not str(uid).isdigit():
+        return jsonify({"status": "error", "message": "uid must be a number"}), 400
+    response_payload = {"creator": "MEAN²", "status": "success", "Guest_Auth": None, "MajorLogin": None}
     try:
-        uid_int = int(uid)
-    except ValueError:
-        return jsonify({
-            "status": "error",
-            "message": "uid must be a number"
-        }), 400
-
-    oauth_url = "https://100067.connect.garena.com/api/v2/oauth/guest/token:grant"
-    payload = {
-        "client_id": 100067,
-        "client_secret": CLIENT_SECRET,
-        "client_type": 2,
-        "password": pw,
-        "response_type": "token",
-        "uid": uid_int
-    }
-
-    response_payload = {
-        "creator": "MEAN²",
-        "status": "success",
-        "Guest_Auth": None,
-        "MajorLogin": None
-    }
-
+        if access_token:
+            auth_data = jwt_protocol.inspect_token(http_session, access_token)
+            open_id = str(auth_data['open_id'])
+        else:
+            auth_data, open_id, access_token = jwt_protocol.generate_access_token(http_session, uid, pw, CLIENT_SECRET)
+        response_payload['Guest_Auth'] = convert_timestamps_to_human(auth_data)
+    except (requests.RequestException, ValueError):
+        return jsonify({"status": "error", "message": "Guest authentication or token inspection failed"}), 401
     try:
-        r = http_session.post(oauth_url, json=payload, timeout=8)
-        auth_data = response_json_or_text(r)
-        response_payload["Guest_Auth"] = convert_timestamps_to_human(auth_data)
-
-        inner = auth_data.get("data", {})
-        acc_token = inner.get("access_token")
-        open_id = inner.get("open_id")
-
-        if not acc_token or not open_id:
-            return jsonify({
-                "status": "error",
-                "message": "Auth tokens not found in Step 1",
-                "Guest_Auth": response_payload["Guest_Auth"]
-            }), 401
-
-        req_msg = build_major_login_request(open_id, acc_token)
-        enc_data = BmwNoiNoiBmvYasYas(G, F, req_msg.SerializeToString())
-        headers = {
-            "X-GA": "v1 1",
-            "ReleaseVersion": "OB55",
-            "Content-Type": "application/octet-stream",
-            "User-Agent": USERAGENT,
-            "Connection": "Keep-Alive",
-            "Accept-Encoding": "gzip",
-            "Expect": "100-continue",
-            "X-Unity-Version": "2018.4.11f1"
-        }
-
-        resp = http_session.post(
-            "https://loginbp.ppmainecoonghj.com/MajorLogin",
-            data=enc_data,
-            headers={**headers, "Host": "loginbp.ggpolarbear.com"},
-            verify=False,
-            timeout=8
-        )
-
-        if resp.status_code != 200:
-            return jsonify({
-                "status": "error",
-                "message": f"MajorLogin failed with status {resp.status_code}",
-                "Guest_Auth": response_payload["Guest_Auth"]
-            }), 502
-
-        res_msg = MajorLoginRes_pb2.MajorLoginRes()
-        res_msg.ParseFromString(resp.content)
-        major_dict = MessageToDict(res_msg, preserving_proto_field_name=True)
-
+        major_dict = dict(jwt_protocol.major_login(http_session, open_id, access_token))
         if 'ttl' in major_dict:
             major_dict['ttl'] = format_ttl(int(major_dict['ttl']))
 
@@ -1496,11 +1348,8 @@ def jwt_login():
         response_payload["MajorLogin"] = convert_timestamps_to_human(ordered_major_dict)
         return jsonify(response_payload), 200
 
-    except Exception as e:
-        return jsonify({
-            "status": "error",
-            "message": str(e)
-        }), 500
+    except (requests.RequestException, ValueError):
+        return jsonify({"status": "error", "message": "MajorLogin failed or did not return a JWT token"}), 502
 
 @FAHHHH.route('/access-token', methods=['GET', 'POST'])
 def access_token_api():
@@ -1516,7 +1365,7 @@ def access_token_api():
 
 def run_like_api(token_file, endpoint_name, auto_slot=False):
     uid = request.args.get("uid")
-    requested_region = request.args.get("server_name") or request.args.get("region")
+    requested_region = request.args.get("region") or request.args.get("server_name")
 
     if not uid:
         return jsonify({"success": False, "error": f"UID is required. Use /{endpoint_name}?uid=xxx"}), 400
@@ -1525,21 +1374,26 @@ def run_like_api(token_file, endpoint_name, auto_slot=False):
     except ValueError:
         return jsonify({"success": False, "error": "uid must be a number"}), 400
 
-    detected_region = get_cached_region(uid)
-    if not detected_region:
-        player_data, detected_region = fetch_player_personal_show(uid)
-        if player_data:
-            basic_info = player_data.get("basicInfo") or player_data.get("basic_info") or {}
-            detected_region = basic_info.get("region") or detected_region
-        if detected_region:
-            set_cached_region(uid, detected_region)
-    if requested_region:
-        region = requested_region.upper()
-    else:
-        region = detected_region
-
-    if region not in REGNS:
+    region = normalize_region(requested_region)
+    detected_region = None
+    if region and region not in REGNS:
         return jsonify({"success": False, "error": f"Unsupported region: {region}"}), 400
+    if not region:
+        detected_region = normalize_region(get_cached_region(uid))
+        if detected_region not in REGNS:
+            player_data, lookup_region = fetch_player_personal_show(uid)
+            basic_info = (player_data or {}).get("basicInfo") or (player_data or {}).get("basic_info") or {}
+            detected_region = normalize_region(basic_info.get("region") or lookup_region)
+            if detected_region in REGNS:
+                set_cached_region(uid, detected_region)
+        region = detected_region
+        if region not in REGNS:
+            return jsonify({
+                "success": False,
+                "error": "Automatic region lookup failed. Check the UID or retry when the profile service is available.",
+                "code": "REGION_LOOKUP_FAILED",
+                "profile_check": f"/meanffinfo?uid={uid}",
+            }), 502
 
     reservation = None
     tracker = FAHHHH.extensions["slot_usage"]
@@ -1612,42 +1466,35 @@ def OMG():
     uid = request.args.get('uid')
     if not uid:
         return jsonify({"error": "Please provide UID."}), 400
-    
-    if uid in UID_MEMORY:
-        try:
-            data = asyncio.run(LoL(uid, "7", UID_MEMORY[uid], "/GetPlayerPersonalShow"))
-            data = HeHe(data)
-            return json.dumps(data, indent=2, ensure_ascii=False), 200, {'Content-Type': 'application/json; charset=utf-8'}
-        except:
-            pass
-    
-    for reg in REGNS:
-        try:
-            data = asyncio.run(LoL(uid, "7", reg, "/GetPlayerPersonalShow"))
-            UID_MEMORY[uid] = reg
-            data = HeHe(data)
-            return json.dumps(data, indent=2, ensure_ascii=False), 200, {'Content-Type': 'application/json; charset=utf-8'}
-        except:
-            continue
-    
-    return jsonify({"error": "UID not found in any region."}), 404
+    data, _ = fetch_player_personal_show(uid)
+    if data is None:
+        return jsonify({"error": "UID not found or profile lookup unavailable."}), 404
+    return json.dumps(data, indent=2, ensure_ascii=False), 200, {'Content-Type': 'application/json; charset=utf-8'}
+
 
 def fetch_player_personal_show(uid):
-    if uid in UID_MEMORY:
-        try:
-            data = asyncio.run(LoL(uid, "7", UID_MEMORY[uid], "/GetPlayerPersonalShow"))
-            return HeHe(data), UID_MEMORY[uid]
-        except Exception:
-            pass
-
-    for reg in REGNS:
+    uid = str(uid)
+    candidates = [get_cached_region(uid), UID_MEMORY.get(uid), *sorted(REGNS)]
+    tried = set()
+    for candidate in candidates:
+        reg = normalize_region(candidate)
+        if reg not in REGNS or reg in tried:
+            continue
+        tried.add(reg)
         try:
             data = asyncio.run(LoL(uid, "7", reg, "/GetPlayerPersonalShow"))
-            UID_MEMORY[uid] = reg
-            return HeHe(data), reg
-        except Exception:
+            basic = data.get("basicInfo") or data.get("basic_info") or {}
+            account_id = basic.get("accountId") or basic.get("account_id")
+            region = normalize_region(basic.get("region"))
+            if str(account_id) != uid or region not in REGNS:
+                continue
+            data = HeHe(data)
+        except Exception as exc:
+            FAHHHH.logger.warning("Profile lookup failed for region %s (%s)", reg, type(exc).__name__)
             continue
-
+        UID_MEMORY[uid] = region
+        set_cached_region(uid, region)
+        return data, region
     return None, None
 
 @FAHHHH.route('/check-region', methods=['GET'])
