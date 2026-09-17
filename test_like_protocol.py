@@ -1,4 +1,4 @@
-﻿"""Offline checks for the supplied OB55 like request protocol."""
+"""Offline checks for the supplied OB55 like request protocol."""
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 import lssj
@@ -37,6 +37,40 @@ class LikeProtocolTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(lssj, 'RtY', new_callable=AsyncMock, return_value=('fallback', 'BD', 'unused')) as login, patch.object(lssj, 'send_like_request', new_callable=AsyncMock, return_value=200):
             self.assertEqual(await lssj.send_like_requests('123', 'BD'), [200])
             login.assert_awaited_once_with('BD')
+
+
+class LikeBatchDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_all_220_tokens_sent_with_bounded_concurrency_and_shared_client(self):
+        import asyncio
+        active = 0
+        peak = 0
+        clients = set()
+        received = []
+        async def send(payload, token, url, client=None):
+            nonlocal active, peak
+            active += 1
+            peak = max(peak, active)
+            clients.add(id(client))
+            received.append(token)
+            await asyncio.sleep(0)
+            active -= 1
+            return 200
+        tokens = ['token-' + str(n) for n in range(220)]
+        with patch.object(lssj, 'send_like_request', side_effect=send):
+            results = await lssj.send_like_requests('123', 'SG', tokens=tokens)
+        self.assertEqual(len(results), 220)
+        self.assertEqual(set(received), set(tokens))
+        self.assertLessEqual(peak, 25)
+        self.assertEqual(len(clients), 1)
+
+    def test_results_distinguish_rejections_and_network_failures(self):
+        result = lssj.summarize_like_results([200, 200, 401, 429, 'ReadTimeout', RuntimeError('private details')])
+        self.assertEqual(result['attempted'], 6)
+        self.assertEqual(result['http_200'], 2)
+        self.assertEqual(result['http_non_200'], 2)
+        self.assertEqual(result['network_errors'], 2)
+        self.assertEqual(result['http_status_counts'], {'200': 2, '401': 1, '429': 1})
+        self.assertNotIn('private details', str(result))
 
 if __name__ == '__main__':
     unittest.main()

@@ -1222,13 +1222,17 @@ async def fetch_like_info_with_tokens(uid, region, tokens=None):
             continue
     raise last_error or RuntimeError("Could not fetch like info")
 
-async def send_like_request(payload, token, url):
+async def send_like_request(payload, token, url, client=None):
     try:
-        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, verify=False) as cl:
-            res = await cl.post(url, data=payload, headers=like_headers(token))
+        if client is None:
+            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, verify=False) as cl:
+                res = await cl.post(url, data=payload, headers=like_headers(token))
+        else:
+            res = await client.post(url, data=payload, headers=like_headers(token))
         return res.status_code
-    except Exception as e:
-        return str(e)
+    except Exception as exc:
+        return type(exc).__name__
+
 
 async def send_like_requests(uid, region, count=None, tokens=None):
     server = like_server_url(region)
@@ -1238,8 +1242,35 @@ async def send_like_requests(uid, region, count=None, tokens=None):
     count = count or len(tokens)
     payload = create_like_payload(uid, region)
     url = server + "/LikeProfile"
-    tasks = [send_like_request(payload, tokens[i % len(tokens)], url) for i in range(count)]
-    return await asyncio.gather(*tasks, return_exceptions=True)
+    semaphore = asyncio.Semaphore(25)
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, verify=False,
+                                 limits=httpx.Limits(max_connections=25, max_keepalive_connections=25)) as client:
+        async def send(token):
+            async with semaphore:
+                return await send_like_request(payload, token, url, client=client)
+        tasks = [send(tokens[i % len(tokens)]) for i in range(count)]
+        return await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def summarize_like_results(results):
+    statuses = defaultdict(int)
+    errors = defaultdict(int)
+    for result in results:
+        if isinstance(result, int):
+            statuses[str(result)] += 1
+        else:
+            # Only expose exception categories, never request URLs or credentials.
+            category = type(result).__name__ if isinstance(result, BaseException) else str(result)
+            errors[category if category.isidentifier() else "RequestError"] += 1
+    return {
+        "attempted": len(results),
+        "http_200": statuses.get("200", 0),
+        "http_non_200": sum(count for status, count in statuses.items() if status != "200"),
+        "network_errors": sum(errors.values()),
+        "http_status_counts": dict(statuses),
+        "error_counts": dict(errors),
+    }
+
 
 def get_like_account_info(data):
     return data.get("AccountInfo") or data.get("accountInfo") or {}
@@ -1437,6 +1468,7 @@ def run_like_api(token_file, endpoint_name, auto_slot=False):
             "slot": slot,
             "slot_new": slot_new,
             "tokens_used": len(like_tokens),
+            "send_results": summarize_like_results(results),
         }
 
         if auto_slot and slot:

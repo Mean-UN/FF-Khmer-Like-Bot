@@ -61,3 +61,11 @@ Offline checks: `python -m unittest test_like_protocol test_jwt_protocol test_sl
 ## Automatic region detection
 
 UID-only `/like` and `/likeff` requests read `regions.json` first. On a cache miss they use the same `fetch_player_personal_show` function as `/meanffinfo`. The lookup validates `basicInfo.accountId` and `basicInfo.region`, saves the returned region to `regions.json`, and updates the in-memory cache. Successful `/meanffinfo` requests now also populate that persistent cache. No region parameter is required. A failed profile lookup returns `REGION_LOOKUP_FAILED` with a profile-check URL and does not send likes.
+
+## Diagnosing fewer likes than tokens
+
+`tokens_used` is the number of loaded tokens attempted, not confirmed likes. `LikesGivenByAPI` remains the measured profile-count increase. HTTP 200 counts are reported separately and do not prove that a like was added.
+
+Both like routes now return `send_results` with `attempted`, `http_200`, `http_non_200`, `network_errors`, `http_status_counts`, and `error_counts`. This exposes rejected requests and timeouts that were previously discarded. Requests use one shared HTTP client and at most 25 concurrent sends. Every configured token is still attempted; a 220-token slot has 220 attempts. Failed sends are not automatically retried because the server may already have applied the request.
+
+A local audit found slot 1 contains 220 unique JWTs for 220 unique SG account IDs with future expiry claims. This does not establish server acceptance or account eligibility to add a like. Server-side limits and repeat-like behavior have not been verified.
