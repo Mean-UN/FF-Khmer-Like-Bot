@@ -762,6 +762,54 @@ def assign_likeff_slot(uid):
 
     raise RuntimeError(f"All {LIKEFF_SLOT_COUNT} LikeFF slots are already full today")
 
+def validate_like_jwt(session, token, account_id, region):
+    """Check JWT metadata and authenticate a read of the sender's own profile."""
+    raw_token = str(token or "")
+    if len(raw_token.split(".")) != 3 or any(not part for part in raw_token.split(".")):
+        raise ValueError("Malformed JWT returned by MajorLogin")
+    try:
+        header_part, _, signature_part = raw_token.split(".")
+        header = json.loads(base64.urlsafe_b64decode(header_part + '=' * (-len(header_part) % 4)))
+        signature = base64.b64decode(signature_part + '=' * (-len(signature_part) % 4), altchars=b'-_', validate=True)
+    except (ValueError, UnicodeError):
+        raise ValueError("Malformed JWT header or signature") from None
+    if not isinstance(header, dict) or not header.get('alg') or header.get('alg') == 'none':
+        raise ValueError("JWT signing algorithm missing or invalid")
+    if header.get('alg') == 'HS256' and len(signature) != 32:
+        raise ValueError("Malformed HS256 signature length")
+    claims = decode_jwt_payload(raw_token)
+    if not isinstance(claims, dict):
+        raise ValueError("Malformed JWT claims")
+    expires = claims.get("exp")
+    if isinstance(expires, bool) or not isinstance(expires, (int, float)) or not (expires > time.time() + 60):
+        raise ValueError("JWT expiry missing, expired or too close to expiry")
+    account_id = str(account_id or "")
+    if not account_id.isdigit() or int(account_id) <= 0:
+        raise ValueError("JWT account ID missing")
+    if claims.get("account_id") is not None and str(claims["account_id"]) != account_id:
+        raise ValueError("JWT account ID does not match login response")
+    region = normalize_region(region)
+    if region not in REGNS:
+        raise ValueError("JWT region missing or unsupported")
+    if claims.get("lock_region") and not is_region_match(region, claims["lock_region"]):
+        raise ValueError("JWT region does not match login response")
+    response = session.post(
+        like_server_url(region) + "/GetPlayerPersonalShow",
+        data=create_like_count_payload(account_id), headers=like_headers(raw_token), timeout=15)
+    response.raise_for_status()
+    profile = like_count_pb2.Info()
+    try:
+        profile.ParseFromString(response.content)
+    except message.DecodeError:
+        raise ValueError("JWT profile validation returned invalid protobuf") from None
+    info = get_like_account_info(json_format.MessageToDict(profile))
+    if str(info.get("UID")) != account_id:
+        raise ValueError("JWT profile validation did not return the expected account")
+    return {"profile_http_status": response.status_code,
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+            "like_profile_verified": False}
+
+
 def fetch_guest_jwt_for_like(uid, password, session=None):
     session = session if session is not None else http_session
     _, open_id, access_token = jwt_protocol.generate_access_token(session, uid, password, CLIENT_SECRET)
@@ -772,12 +820,14 @@ def fetch_guest_jwt_for_like(uid, password, session=None):
     jwt_payload = decode_jwt_payload(jwt_token)
     account_id = major_login.get("account_id") or jwt_payload.get("account_id")
     region = major_login.get("lock_region") or major_login.get("noti_region") or jwt_payload.get("lock_region")
+    validation = validate_like_jwt(session, jwt_token, account_id, region)
     return {
         "uid": str(uid),
         "account_id": account_id,
         "name": extract_nickname_from_jwt(jwt_token),
         "region": region,
         "token": jwt_token,
+        "validation": validation,
     }
 
 def fetch_guest_jwt_for_like_with_retry(uid, password, max_retries=LIKE_TOKEN_MAX_RETRIES, retry_delay=LIKE_TOKEN_RETRY_DELAY, session=None):
@@ -1379,6 +1429,11 @@ def jwt_login():
         return jsonify({"status": "error", "message": "Guest authentication or token inspection failed"}), 401
     try:
         major_dict = dict(jwt_protocol.major_login(http_session, open_id, access_token))
+        claims = decode_jwt_payload(major_dict.get('token'))
+        response_payload['TokenValidation'] = validate_like_jwt(
+            http_session, major_dict.get('token'),
+            major_dict.get('account_id') or claims.get('account_id'),
+            major_dict.get('lock_region') or claims.get('lock_region'))
         if 'ttl' in major_dict:
             major_dict['ttl'] = format_ttl(int(major_dict['ttl']))
 
@@ -1400,7 +1455,7 @@ def jwt_login():
         return jsonify(response_payload), 200
 
     except (requests.RequestException, ValueError):
-        return jsonify({"status": "error", "message": "MajorLogin failed or did not return a JWT token"}), 502
+        return jsonify({"status": "error", "message": "MajorLogin or JWT profile validation failed"}), 502
 
 @FAHHHH.route('/access-token', methods=['GET', 'POST'])
 def access_token_api():

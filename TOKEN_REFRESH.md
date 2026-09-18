@@ -48,3 +48,6 @@ Deploy `telegram_bot.py`, `update_like_tokens.py`, `lssj.py`, and
 `token_refresh_alerts.py` together, then restart the bot and API.
 Verification uses mocked authentication and Telegram; no real token refreshes
 or messages are sent by `test_token_refresh.py`.
+
+
+Refresh now counts an account as refreshed only after JWT metadata checks and an authenticated read of its own profile return the expected account. A profile HTTP 401 is reported as a refresh failure. Stored validation metadata records the check time; this is not a guarantee of LikeProfile acceptance or future session validity. Old entries are preserved when their replacement fails and are not counted as newly refreshed.

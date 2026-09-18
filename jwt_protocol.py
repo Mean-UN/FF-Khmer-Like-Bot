@@ -72,23 +72,41 @@ def parse_login_response(data):
                 continue
             if response.token:
                 return MessageToDict(response, preserving_proto_field_name=True)
+    # Field 8 is a length-delimited JWT. Preserve its exact bytes even if
+    # unrelated trailing fields are malformed. Regex over the response can
+    # consume an adjacent protobuf tag as part of the JWT signature.
     for candidate in candidates:
-        for match in re.finditer(rb'eyJ[\w-]+\.eyJ[\w-]+\.[\w-]+', candidate):
-            token = match.group().decode('ascii')
-            try:
-                payload = token.split('.')[1]
-                claims = json.loads(base64.urlsafe_b64decode(payload + '=' * (-len(payload) % 4)))
-                if not isinstance(claims, dict):
-                    continue
-            except (ValueError, UnicodeError):
+        for position, tag in enumerate(candidate):
+            if tag != 0x42:
                 continue
-            # Claims are metadata only; decoding does not verify the JWT signature.
-            result = {"token": token}
-            if claims.get("account_id") is not None:
-                result["account_id"] = str(claims["account_id"])
-            if claims.get("lock_region"):
-                result["lock_region"] = claims["lock_region"]
-            return result
+            cursor = position + 1
+            length = 0
+            for shift in range(0, 35, 7):
+                if cursor >= len(candidate):
+                    break
+                value = candidate[cursor]
+                cursor += 1
+                length |= (value & 0x7f) << shift
+                if value < 0x80:
+                    if length <= 0 or cursor + length > len(candidate):
+                        break
+                    raw_token = candidate[cursor:cursor + length]
+                    if not re.fullmatch(rb'eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+', raw_token):
+                        break
+                    try:
+                        token = raw_token.decode('ascii')
+                        payload = token.split('.')[1]
+                        claims = json.loads(base64.urlsafe_b64decode(payload + '=' * (-len(payload) % 4)))
+                        if not isinstance(claims, dict):
+                            break
+                    except (ValueError, UnicodeError):
+                        break
+                    result = {"token": token}
+                    if claims.get("account_id") is not None:
+                        result["account_id"] = str(claims["account_id"])
+                    if claims.get("lock_region"):
+                        result["lock_region"] = claims["lock_region"]
+                    return result
     raise ValueError("MajorLogin did not return a JWT token")
 
 

@@ -40,10 +40,12 @@ class JwtProtocolTests(unittest.TestCase):
 
     def test_regex_fallback_does_not_invent_region(self):
         payload = base64.urlsafe_b64encode(json.dumps({'account_id': 123}).encode()).rstrip(b'=')
-        raw = b'\xffeyJhbGciOiJIUzI1NiJ9.'+payload+b'.signature\xff'
+        token = b'eyJhbGciOiJIUzI1NiJ9.'+payload+b'.signature'
+        raw = b'\xff\x42'+bytes([len(token)])+token+b'H\x7f\xff'
         parsed = protocol.parse_login_response(raw)
         self.assertEqual(parsed['account_id'], '123')
         self.assertNotIn('lock_region', parsed)
+        self.assertEqual(parsed['token'].encode(), token)
 
     def test_oauth_flat_and_nested(self):
         for auth in ({'open_id':'open','access_token':'access'}, {'data':{'open_id':'open','access_token':'access'}}):
@@ -55,7 +57,7 @@ class JwtRouteTests(unittest.TestCase):
     def test_routes_and_refresh(self):
         import lssj
         client=lssj.app.test_client()
-        with patch.object(protocol, 'generate_access_token', return_value=({'open_id':'open'}, 'open', 'access')), patch.object(protocol, 'inspect_token', return_value={'open_id':'open'}), patch.object(protocol, 'major_login', return_value={'account_id':'123', 'lock_region':'SG', 'token':'test-token'}):
+        with patch.object(lssj, 'validate_like_jwt', return_value={'profile_http_status':200}), patch.object(protocol, 'generate_access_token', return_value=({'open_id':'open'}, 'open', 'access')), patch.object(protocol, 'inspect_token', return_value={'open_id':'open'}), patch.object(protocol, 'major_login', return_value={'account_id':'123', 'lock_region':'SG', 'token':'test-token'}):
             for response in (client.get('/jwt?uid=123&pw=pw'), client.post('/jwt', json={'access_token':'access'})):
                 self.assertEqual(response.status_code, 200)
                 self.assertEqual(response.json['MajorLogin']['jwt_token'], 'test-token')
@@ -63,5 +65,55 @@ class JwtRouteTests(unittest.TestCase):
         self.assertEqual(client.get('/jwt').status_code, 400)
         with patch.object(protocol, 'inspect_token', return_value={'open_id':'open'}), patch.object(protocol, 'major_login', side_effect=ValueError('no token')):
             self.assertEqual(client.post('/jwt', json={'access_token':'access'}).status_code, 502)
+
+
+
+class JwtValidationTests(unittest.TestCase):
+    def token(self, **overrides):
+        import time
+        claims = {'account_id':123, 'lock_region':'SG', 'exp':int(time.time())+3600}
+        claims.update(overrides)
+        payload = base64.urlsafe_b64encode(json.dumps(claims).encode()).rstrip(b'=').decode()
+        return 'eyJhbGciOiJIUzI1NiJ9.'+payload+'.'+base64.urlsafe_b64encode(b'x'*32).rstrip(b'=').decode()
+
+    def test_profile_acceptance_required(self):
+        import lssj
+        profile = lssj.like_count_pb2.Info()
+        profile.AccountInfo.UID = 123
+        session = Mock()
+        session.post.return_value.content = profile.SerializeToString()
+        session.post.return_value.status_code = 200
+        result = lssj.validate_like_jwt(session, self.token(), '123', 'SG')
+        self.assertEqual(result['profile_http_status'], 200)
+        self.assertFalse(result['like_profile_verified'])
+        self.assertTrue(session.post.call_args.args[0].endswith('/GetPlayerPersonalShow'))
+
+    def test_401_never_passes_refresh(self):
+        import lssj, requests
+        session = Mock()
+        response = Mock(status_code=401)
+        session.post.return_value.raise_for_status.side_effect = requests.HTTPError(response=response)
+        with patch.object(protocol, 'generate_access_token', return_value=({},'open','access')), patch.object(protocol, 'major_login', return_value={'token':self.token(),'account_id':'123','lock_region':'SG'}):
+            with self.assertRaises(requests.HTTPError):
+                lssj.fetch_guest_jwt_for_like('guest','password',session=session)
+
+    def test_expired_or_mismatched_metadata_rejected_before_request(self):
+        import lssj
+        for token in (self.token(exp=1), self.token(exp=None), self.token(account_id=456), self.token(lock_region='BR'), self.token()+'H', 'not-a-jwt'):
+            session=Mock()
+            with self.subTest(token_type=token[-10:]), self.assertRaises(ValueError):
+                lssj.validate_like_jwt(session, token, '123', 'SG')
+            session.post.assert_not_called()
+
+    def test_wrong_profile_cannot_validate(self):
+        import lssj
+        session=Mock()
+        session.post.return_value.content=lssj.like_count_pb2.Info().SerializeToString()
+        with self.assertRaises(ValueError):
+            lssj.validate_like_jwt(session, self.token(), '123', 'SG')
+
+    def test_unframed_regex_token_is_rejected(self):
+        with self.assertRaises(ValueError):
+            protocol.parse_login_response(b'\xff'+self.token().encode()+b'H\x7f\xff')
 
 if __name__ == '__main__': unittest.main()

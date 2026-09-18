@@ -42,7 +42,7 @@ The response retains `Guest_Auth` and `MajorLogin`, including `MajorLogin.jwt_to
 
 Existing protobuf modules are retained: reference response field 1 maps to `account_id`, 2 to `lock_region`, 10 to `server_url`, 21 to `kts`, 22 to `ak`, and 23 to `aiv`. Loading the reference's duplicate descriptor names into the default pool is unnecessary and could cause conflicts.
 
-Response parsing handles plaintext, gzip, zlib, raw deflate, bounded prefix offsets, AES-CBC responses, and a final JWT extraction fallback. A response without a token is rejected. JWT fallback claims are unverified metadata, and no region is invented. TLS verification stays enabled. The reference's public-IP lookup is omitted; client IP remains `0.0.0.0` as in the existing API.
+Response parsing handles plaintext, gzip, zlib, raw deflate, bounded prefix offsets, AES-CBC responses, and an exact-length protobuf token-field fallback. A response without a token is rejected. JWT claim decoding provides unverified metadata, and no region is invented. TLS verification stays enabled. The reference's public-IP lookup is omitted; client IP remains `0.0.0.0` as in the existing API.
 
 ## Verification
 
@@ -71,3 +71,16 @@ Both like routes now return `send_results` with `attempted`, `http_200`, `http_n
 A local audit found slot 1 contains 220 unique JWTs for 220 unique SG account IDs with future expiry claims. This does not establish server acceptance or account eligibility to add a like. Server-side limits and repeat-like behavior have not been verified.
 
 The latest function-by-function reference comparison is in `LIKE_REFERENCE_REVIEW.md`.
+
+
+## JWT rejection fix and refresh validation
+
+The reference regex fallback could consume the following protobuf field tag (`0x48`, ASCII `H`) as part of the JWT signature. The fallback now reads field 8's declared protobuf length. Unframed regex extraction is rejected rather than guessing where a signature ends.
+
+Both `/jwt` and like-token refresh validate token structure, HS256 signature length, expiry (at least 60 seconds remaining), account ID and region consistency. They then authenticate a read of the sender's own profile using the same client host and headers as likes. Only an HTTP-success response containing the expected account passes. A 401, malformed profile, wrong account or invalid token makes refresh fail instead of counting as success.
+
+Successful refreshed entries include `validation.profile_http_status`, `validation.checked_at`, and `validation.like_profile_verified: false`. `/jwt` returns the same metadata under `TokenValidation`. These checks do not locally verify the JWT signature or prove acceptance by LikeProfile; the profile server checks authentication. Later expiration or session invalidation can still cause 401.
+
+A local audit found 89 tokens in slot 1 and five in slot 2 with an extra trailing H. At audit time all 229 local saved tokens were past expiry. One affected slot-1 account was refreshed with the fixed parser, returned a 43-character HS256 signature, passed the read-only profile check with HTTP 200, and was saved. Other entries were not refreshed in this check. No live likes were sent.
+
+Refresh remaining slots using the existing updater, for example `python update_like_tokens.py likeff --slot 1`. Failed refreshes preserve previous entries, which may already be expired; inspect the failed count rather than assuming all entries in the file were newly validated.
