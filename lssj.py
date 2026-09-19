@@ -70,37 +70,6 @@ LIKEFF_UIDS_PER_SLOT = 30
 REGION_CACHE_FILE = "regions.json"
 LIKE_TOKEN_MAX_RETRIES = 10
 LIKE_TOKEN_RETRY_DELAY = 0.7
-BIO_MAJOR_LOGIN_URL = "https://loginbp.ppmainecoonghj.com/MajorLogin"
-BIO_OAUTH_URL = "https://100067.connect.garena.com/oauth/guest/token/grant"
-BIO_INSPECT_URL = "https://100067.connect.garena.com/oauth/token/inspect"
-BIO_FREEFIRE_VERSION = "OB55"
-BIO_UPDATE_URLS = [
-    "https://client.ind.freefiremobile.com/UpdateSocialBasicInfo",
-    "https://clientbp.ggpolarbear.com/UpdateSocialBasicInfo",
-    "https://client.us.freefiremobile.com/UpdateSocialBasicInfo",
-    "https://clientbp.common.ggbluefox.com/UpdateSocialBasicInfo",
-]
-BIO_HEADERS = {
-    "Expect": "100-continue",
-    "X-Unity-Version": "2018.4.11f1",
-    "X-GA": "v1 1",
-    "ReleaseVersion": BIO_FREEFIRE_VERSION,
-    "Content-Type": "application/x-www-form-urlencoded",
-    "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 11; SM-A305F Build/RP1A.200720.012)",
-    "Connection": "Keep-Alive",
-    "Accept-Encoding": "gzip",
-}
-BIO_LOGIN_HEADERS = {
-    "Host": "loginbp.ggpolarbear.com",
-    "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
-    "Connection": "Keep-Alive",
-    "Accept-Encoding": "gzip",
-    "Content-Type": "application/octet-stream",
-    "Expect": "100-continue",
-    "X-Unity-Version": "2018.4.11f1",
-    "X-GA": "v1 1",
-    "ReleaseVersion": BIO_FREEFIRE_VERSION,
-}
 BAN_REASON_MAP = {
     0: "Unknown",
     1: "In-game automatic ban",
@@ -287,69 +256,33 @@ def decode_bio_jwt(token):
         return None
 
 def bio_guest_login(uid, password):
-    payload = {
-        "uid": str(uid),
-        "password": str(password),
-        "response_type": "token",
-        "client_type": "2",
-        "client_secret": CLIENT_SECRET,
-        "client_id": CLIENT_ID,
-    }
-    headers = {"User-Agent": "GarenaMSDK/4.0.19P9(SM-M526B ;Android 13;pt;BR;)"}
-    response = http_session.post(BIO_OAUTH_URL, data=payload, headers=headers, timeout=15, verify=False)
-    data = response_json_or_text(response)
-    if response.status_code != 200 or not isinstance(data, dict):
-        return None, None, data
-    return data.get("access_token"), data.get("open_id"), data
+    auth, open_id, access_token = jwt_protocol.generate_access_token(
+        http_session, uid, password, CLIENT_SECRET)
+    return access_token, open_id, auth
+
 
 def get_bio_openid_from_inspect(access_token):
-    headers = {"User-Agent": "GarenaMSDK/4.0.30", "Accept": "application/json"}
-    response = http_session.get(f"{BIO_INSPECT_URL}?token={access_token}", headers=headers, timeout=15, verify=False)
-    data = response_json_or_text(response)
-    if response.status_code != 200 or not isinstance(data, dict):
-        return None, data
-    return data.get("open_id"), data
+    info = jwt_protocol.inspect_token(http_session, access_token)
+    return info["open_id"], info
+
 
 def bio_major_login(access_token, open_id):
-    for platform_type in (8, 3, 4, 6):
-        try:
-            game = GameData()
-            game.timestamp = "2024-12-05 18:15:32"
-            game.game_name = "free fire"
-            game.game_version = 1
-            game.version_code = "2.124.1"
-            game.os_info = "Android OS 9 / API-28 (PI/rel.cjw.20220518.114133)"
-            game.device_type = "Handheld"
-            game.network_provider = "Verizon Wireless"
-            game.connection_type = "WIFI"
-            game.screen_width = 1280
-            game.screen_height = 960
-            game.dpi = "240"
-            game.cpu_info = "ARMv7 VFPv3 NEON VMH | 2400 | 4"
-            game.total_ram = 5951
-            game.gpu_name = "Adreno (TM) 640"
-            game.gpu_version = "OpenGL ES 3.0"
-            game.user_id = "Google|74b585a9-0268-4ad3-8f36-ef41d2e53610"
-            game.ip_address = "172.190.111.97"
-            game.language = "en"
-            game.open_id = open_id
-            game.access_token = access_token
-            game.platform_type = platform_type
-            game.field_99 = str(platform_type)
-            game.field_100 = str(platform_type)
+    result = jwt_protocol.major_login(http_session, open_id, access_token)
+    return result.get("token"), 4
 
-            encrypted = BmwNoiNoiBmvYasYas(G, F, game.SerializeToString())
-            response = http_session.post(BIO_MAJOR_LOGIN_URL, data=encrypted, headers=BIO_LOGIN_HEADERS, verify=False, timeout=15)
-            if response.status_code == 200:
-                msg = Garena_420()
-                msg.ParseFromString(response.content)
-                if msg.token:
-                    return msg.token, platform_type
-        except Exception:
-            continue
-    return None, None
 
 def update_social_bio(jwt_token, bio_text):
+    account = decode_bio_jwt(jwt_token) or {}
+    region = str(account.get("region") or "").upper()
+    if region in {"IND", "IN"}:
+        host = "client.ind.freefiremobile.com"
+    elif region in {"US", "NA", "BR", "SAC"}:
+        host = "client.us.freefiremobile.com"
+    elif region in {"SG", "BP", "BD", "PK", "TH", "VN", "ID", "TW", "ME", "RU", "EU"}:
+        host = "clientbp.ggblueshark.com"
+    else:
+        raise ValueError(f"Unsupported or missing JWT region: {region or 'missing'}")
+    url = f"https://{host}/UpdateSocialBasicInfo"
     data = BioData()
     data.field_2 = 17
     data.field_5.CopyFrom(EmptyMessage())
@@ -358,20 +291,22 @@ def update_social_bio(jwt_token, bio_text):
     data.field_9 = 1
     data.field_11.CopyFrom(EmptyMessage())
     data.field_12.CopyFrom(EmptyMessage())
-    encrypted = BmwNoiNoiBmvYasYas(G, F, data.SerializeToString())
+    # Empty length-delimited field 16, present in the supplied OB55 payload.
+    plain = data.SerializeToString() + b"\x82\x01\x00"
+    encrypted = BmwNoiNoiBmvYasYas(G, F, plain)
+    headers = {
+        "User-Agent": "UnityPlayer/2018.4.12f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)",
+        "Accept": "*/*", "Accept-Encoding": "deflate, gzip",
+        "X-GA": "v1 1", "ReleaseVersion": jwt_protocol.RELEASE_VERSION,
+        "Content-Type": "application/x-www-form-urlencoded",
+        "X-Unity-Version": "2018.4.12f1",
+        "X-GA-SV": str(int(time.time())),
+        "Authorization": f"Bearer {jwt_token}",
+    }
+    response = http_session.post(url, headers=headers, data=encrypted, timeout=20)
+    response.raise_for_status()
+    return response, url
 
-    headers = BIO_HEADERS.copy()
-    headers["Authorization"] = f"Bearer {jwt_token}"
-    last_error = None
-    for url in BIO_UPDATE_URLS:
-        try:
-            response = http_session.post(url, headers=headers, data=encrypted, timeout=20, verify=False)
-            if response.status_code == 200:
-                return response, url
-            last_error = f"{url} returned HTTP {response.status_code}: {response.text[:200]}"
-        except Exception as exc:
-            last_error = f"{url}: {exc}"
-    raise RuntimeError(last_error or "All update endpoints failed")
 
 def extract_nickname_from_jwt(token):
     try:
@@ -1434,6 +1369,9 @@ def jwt_login():
             http_session, major_dict.get('token'),
             major_dict.get('account_id') or claims.get('account_id'),
             major_dict.get('lock_region') or claims.get('lock_region'))
+        for field in ('account_id', 'lock_region', 'noti_region'):
+            if not major_dict.get(field) and claims.get(field) is not None:
+                major_dict[field] = claims[field]
         if 'ttl' in major_dict:
             major_dict['ttl'] = format_ttl(int(major_dict['ttl']))
 
@@ -1730,7 +1668,9 @@ def update_bio_api():
         return jsonify({"status": "error", "message": "Bio is required"}), 400
     if len(bio) > 250:
         return jsonify({"status": "error", "message": "Bio must be 250 characters or less"}), 400
-    jwt_token = str(raw_token or "").strip() if looks_like_jwt(raw_token) else None
+    if raw_token.lower().startswith("bearer "):
+        raw_token = raw_token[7:].strip()
+    jwt_token = raw_token if looks_like_jwt(raw_token) else None
     access_token = None if jwt_token else extract_bio_access_token(raw_token)
     if not access_token and not jwt_token and not (uid and password):
         return jsonify({
@@ -1780,7 +1720,8 @@ def update_bio_api():
     response_time = f"{time.time() - start_time:.2f}s"
     result = {
         "status": "success",
-        "message": "Bio updated",
+        "message": "Bio update accepted by server",
+        "stored": None,
         "success": True,
         "response_time": response_time,
         "bio": bio,

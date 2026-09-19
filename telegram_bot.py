@@ -2898,14 +2898,28 @@ def format_ban_info(data, requested_by="N/A"):
 
 
 def format_jwt_check(data):
+    import base64
     guest_auth = data.get("Guest_Auth") or {}
-    guest_data = guest_auth.get("data") if isinstance(guest_auth, dict) else {}
+    guest_data = guest_auth.get("data", guest_auth) if isinstance(guest_auth, dict) else {}
     major = data.get("MajorLogin") or {}
     access_token = pick(guest_data, "access_token", default="N/A")
     jwt_token = pick(major, "jwt_token", "token", default="N/A")
-    account_id = pick(major, "account_id", "accountId", default="N/A")
+    claims = {}
+    try:
+        raw = str(jwt_token).split()[-1]
+        encoded = raw.split('.')[1]
+        decoded = json.loads(base64.urlsafe_b64decode(encoded + '=' * (-len(encoded) % 4)))
+        if isinstance(decoded, dict):
+            claims = decoded  # Display metadata only; not signature verification.
+    except (ValueError, UnicodeError, IndexError):
+        pass
+    account_id = pick(major, "account_id", "accountId", "account_uid", default=None)
+    if account_id in (None, "", "N/A"):
+        account_id = pick(claims, "account_id", default="N/A")
     name = pick(major, "nickname", "name", default="N/A")
-    region = pick(major, "region", "lock_region", "noti_region", default="N/A")
+    region = pick(major, "region", "lock_region", "noti_region", default=None)
+    if region in (None, "", "N/A"):
+        region = pick(claims, "lock_region", "noti_region", default="N/A")
 
     def v(value):
         return escape(str(value if value not in (None, "") else "N/A"))

@@ -10,6 +10,23 @@ import jwt_protocol as protocol
 from proto import MajorLoginRes_pb2
 
 class JwtProtocolTests(unittest.TestCase):
+    def test_requests_do_not_share_credentials_or_nested_fields(self):
+        first = protocol.build_major_login_request('first', 'first-secret')
+        first.memory_available.version = 999
+        second = protocol.build_major_login_request('second', 'second-secret')
+        self.assertEqual((first.open_id, first.access_token), ('first', 'first-secret'))
+        self.assertEqual((second.open_id, second.access_token), ('second', 'second-secret'))
+        self.assertEqual(second.memory_available.version, 55)
+        self.assertFalse(protocol._MAJOR_LOGIN_TEMPLATE.access_token)
+        self.assertFalse(protocol._MAJOR_LOGIN_TEMPLATE.open_id)
+
+    def test_normal_response_skips_decompression_and_decryption(self):
+        raw = MajorLoginRes_pb2.MajorLoginRes(token='test-token').SerializeToString()
+        with patch.object(protocol, 'decompress_body') as decompress, patch.object(protocol.AES, 'new') as aes:
+            self.assertEqual(protocol.parse_login_response(raw)['token'], 'test-token')
+        decompress.assert_not_called()
+        aes.assert_not_called()
+
     def test_request_matches_reference(self):
         req = protocol.build_major_login_request('open', 'access')
         self.assertEqual((req.open_id, req.access_token, req.client_version_code), ('open', 'access', '2024010012'))

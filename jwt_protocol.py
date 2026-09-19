@@ -55,6 +55,16 @@ def decompress_body(data):
 
 
 def parse_login_response(data):
+    # Requests normally already decompressed the body. Try the normal protobuf
+    # before compression probes, AES, and compatibility offset scanning.
+    response = MajorLoginRes_pb2.MajorLoginRes()
+    try:
+        response.ParseFromString(data)
+    except DecodeError:
+        pass
+    else:
+        if response.token:
+            return MessageToDict(response, preserving_proto_field_name=True)
     data = decompress_body(data)
     candidates = [data]
     if data and len(data) % AES.block_size == 0:
@@ -124,9 +134,8 @@ def major_login(session, open_id, access_token):
     return parse_login_response(response.content)
 
 
-def build_major_login_request(open_id, access_token):
+def _build_major_login_template():
     major_login = MajorLoginReq_pb2.MajorLogin()
-    major_login.event_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     major_login.game_name = "free fire"
     major_login.platform_id = 1
     major_login.client_version = CLIENT_VERSION
@@ -144,12 +153,10 @@ def build_major_login_request(open_id, access_token):
     major_login.unique_device_id = "Google|34a7dcdf-a7d5-4cb6-8d7e-3b0e448a0c57"
     major_login.client_ip = "0.0.0.0"
     major_login.language = "en"
-    major_login.open_id = open_id
     major_login.open_id_type = "4"
     major_login.device_type = "Handheld"
     major_login.memory_available.version = 55
     major_login.memory_available.hidden_value = 81
-    major_login.access_token = access_token
     major_login.platform_sdk_id = 1
     major_login.network_operator_a = "Verizon"
     major_login.network_type_a = "WIFI"
@@ -182,4 +189,19 @@ def build_major_login_request(open_id, access_token):
     major_login.is_vpn = 0
     major_login.origin_platform_type = "4"
     major_login.primary_platform_type = "4"
+    return major_login
+
+
+_MAJOR_LOGIN_TEMPLATE = _build_major_login_template()
+
+
+def build_major_login_request(open_id, access_token):
+    # Each login owns its message; credentials never enter the shared template.
+    major_login = MajorLoginReq_pb2.MajorLogin()
+    major_login.CopyFrom(_MAJOR_LOGIN_TEMPLATE)
+    major_login.event_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    major_login.client_version = CLIENT_VERSION
+    major_login.client_version_code = CLIENT_VERSION_CODE
+    major_login.open_id = open_id
+    major_login.access_token = access_token
     return major_login
