@@ -284,9 +284,10 @@ class GuestGenerationTests(unittest.TestCase):
         context = Mock()
         context.__enter__ = Mock(return_value=self.session)
         context.__exit__ = Mock(return_value=False)
-        self.ns = dict(guest_protocol=guest_protocol, AES=AES, unpad=unpad, message=message, json=json, hashlib=hashlib, hmac=hmac, requests=SimpleNamespace(Session=Mock(return_value=context), RequestException=requests.RequestException),
+        self.ns = dict(guest_registration=SimpleNamespace(REGISTRATION_GATE=SimpleNamespace(post=lambda session, url, **kwargs: session.post(url, **kwargs))), jwt_protocol=SimpleNamespace(RELEASE_VERSION="OB55", parse_login_response=Mock(return_value={"token":"fake-jwt", "account_id":"123", "lock_region":"ME"})), guest_protocol=guest_protocol, AES=AES, unpad=unpad, message=message, json=json, hashlib=hashlib, hmac=hmac, requests=SimpleNamespace(Session=Mock(return_value=context), RequestException=requests.RequestException),
                        generate_custom_password=Mock(return_value="original-password"),
                        generate_random_name=Mock(return_value="original-name"), normalize_region=lambda r: r.upper(),
+                       is_region_match=lambda a, b: a == b,
                        urlparse=urlparse, USERAGENT="agent", with_region_ip_headers=lambda h, r: h,
                        response_json_or_text=lambda response: response.json(), CLIENT_SECRET="fake", CLIENT_ID="100067",
                        REGION_LANG={"ME": "en"}, build_proto=Mock(return_value=b"payload"),
@@ -296,7 +297,7 @@ class GuestGenerationTests(unittest.TestCase):
                        build_major_login_request=Mock(return_value=SimpleNamespace(SerializeToString=lambda: b"login")),
                        MajorLoginRes_pb2=SimpleNamespace(MajorLoginRes=Mock(return_value=Mock())),
                        MessageToDict=lambda *a, **kw: {"token": "fake-jwt", "account_id": "123", "lock_region": "ME"},
-                       decode_jwt_payload=lambda token: {}, time=SimpleNamespace(sleep=Mock()))
+                       decode_jwt_payload=lambda token: {}, time=SimpleNamespace(sleep=Mock(), time=lambda: 1800000000))
         exec(compile(ast.Module(body=[node], type_ignores=[]), "lssj.py", "exec"), self.ns)
 
     def response(self, data=None, status=200):
@@ -322,6 +323,29 @@ class GuestGenerationTests(unittest.TestCase):
         login_fields = self.ns["build_proto"].call_args_list[1].args[0]
         self.assertEqual((login_fields[7], login_fields[22], login_fields[26], login_fields[29]), ("1.132.3", "open", "BR", "access"))
 
+    def test_normal_register_uses_reference_fields_and_matching_host(self):
+        self.session.post.side_effect = [self.response({"data": {"uid": "7"}}), self.response({"access_token": "access", "open_id": "open"}), self.response(), self.response()]
+        result = self.run_guest()
+        self.assertTrue(result["success"])
+        fields = self.ns["build_proto"].call_args_list[0].args[0]
+        self.assertEqual((fields[16], fields[17]), (1, 1))
+        self.assertNotIn(20, fields)
+        for call in self.session.post.call_args_list[2:]:
+            headers = call.kwargs["headers"]
+            self.assertEqual(headers["Host"], "example.test")
+            self.assertEqual(headers["Authorization"], "Bearer")
+            self.assertEqual(headers["X-Unity-Version"], "2018.4.12f1")
+            self.assertEqual(headers["X-GA-SV"], "1800000000")
+
+    def test_parse_failure_is_reported_without_losing_credentials(self):
+        self.session.post.side_effect = [self.response({"data": {"uid": "7"}}), self.response({"access_token": "access", "open_id": "open"}), self.response(), self.response()]
+        self.ns["jwt_protocol"].parse_login_response.side_effect = ValueError("invalid login")
+        result = self.run_guest()
+        self.assertFalse(result["success"])
+        self.assertTrue(result["guest_created"])
+        self.assertEqual(result["uid"], "7")
+        self.assertEqual(result["failed_stage"], "MajorLogin")
+
     def test_missing_token_fields_uses_fallback_endpoint(self):
         self.session.post.side_effect = [self.response({"data": {"uid": "7"}}), self.response({}), self.response({"data": {"access_token": "access", "open_id": "open"}}), self.response(), self.response()]
         self.assertTrue(self.run_guest()["major_login_success"])
@@ -341,6 +365,9 @@ class GuestGenerationTests(unittest.TestCase):
 
     def test_reference_region_routes(self):
         import guest_protocol
+        import lssj
+        self.assertEqual(lssj.major_register_url("SG"), "https://loginbp.ppmainecoonghj.com/MajorRegister")
+        self.assertEqual(lssj.major_register_url("SG", True), "https://loginbp.ggblueshark.com/MajorRegister")
         self.assertEqual(guest_protocol.region_host("SG"), "loginbp.ggpolarbear.com")
         self.assertEqual(guest_protocol.region_host("ME"), "loginbp.common.ggbluefox.com")
         self.assertEqual(guest_protocol.region_host("BR"), "loginbp.ggblueshark.com")
@@ -353,13 +380,13 @@ class GuestGenerationTests(unittest.TestCase):
         plaintext = b"simulated-protobuf"
         response = self.response()
         response.content = AES.new(self.ns["G"], AES.MODE_CBC, self.ns["F"]).encrypt(pad(plaintext, 16))
-        self.ns["MessageToDict"] = lambda *a, **kw: {"token": "fake-jwt"}
+        self.ns["jwt_protocol"].parse_login_response.return_value = {"token": "fake-jwt", "lock_region":"ME"}
         self.ns["decode_jwt_payload"] = lambda token: {"external_id": "123"}
         self.session.post.side_effect = [self.response({"data": {"uid": "7"}}), self.response({"access_token": "access", "open_id": "open"}), self.response(), response]
         result = self.run_guest()
         self.assertTrue(result["major_login_success"])
         self.assertEqual(result["account_id"], "123")
-        self.ns["MajorLoginRes_pb2"].MajorLoginRes.return_value.ParseFromString.assert_called_once_with(plaintext)
+        self.ns["jwt_protocol"].parse_login_response.assert_called_once_with(response.content)
 
     def test_major_register_failure_keeps_credentials_and_stops_login(self):
         self.session.post.side_effect = [self.response({"data": {"uid": "7"}}), self.response({"access_token": "access", "open_id": "open"}), self.response(status=500)]
@@ -370,12 +397,72 @@ class GuestGenerationTests(unittest.TestCase):
         self.assertFalse(result["major_login_success"])
         self.assertEqual(self.session.post.call_count, 3)
 
+    def test_http_200_registration_error_exposes_safe_upstream_reason(self):
+        self.session.post.side_effect = [self.response({"code": 1001, "message": "Rejected original-password", "data": {}})]
+        result = self.run_guest()
+        self.assertFalse(result["success"])
+        self.assertEqual(result["failed_stage"], "Guest register")
+        self.assertEqual(result["http_status"], 200)
+        self.assertEqual(result["upstream_error"]["code"], "1001")
+        self.assertEqual(result["upstream_error"]["message"], "Rejected [redacted]")
+        self.assertEqual(self.session.post.call_count, 1)
+
+    def test_http_registration_rejection_is_not_retried(self):
+        self.session.post.side_effect = [self.response({"message": "registration denied"}, status=403)]
+        result = self.run_guest()
+        self.assertEqual(result["http_status"], 403)
+        self.assertEqual(result["upstream_error"]["message"], "registration denied")
+        self.assertEqual(self.session.post.call_count, 1)
+
     def test_registration_timeout_does_not_repeat_registration_in_session(self):
         self.session.post.side_effect = self.requests.Timeout()
         result = self.run_guest()
         self.assertFalse(result["guest_created"])
         self.assertEqual(result["failed_stage"], "Guest register")
         self.assertEqual(self.session.post.call_count, 1)
+
+    def test_missing_region_triggers_selection_and_final_login(self):
+        self.session.post.side_effect = [self.response({"data": {"uid": "7"}}), self.response({"access_token": "access", "open_id": "open"})] + [self.response() for _ in range(5)]
+        self.ns["jwt_protocol"].parse_login_response.side_effect = [
+            {"token": "initial-jwt", "account_id": "123"},
+            {"token": "final-jwt", "account_id": "123", "lock_region": "ME"}]
+        result = self.run_guest()
+        self.assertTrue(result["success"])
+        self.assertEqual(result["jwt_token"], "final-jwt")
+        self.assertEqual(result["region"], "ME")
+        self.assertTrue(self.session.post.call_args_list[4].args[0].endswith('/ChooseNewbieChoice'))
+        self.assertTrue(self.session.post.call_args_list[5].args[0].endswith('/ChooseRegion'))
+        self.assertEqual(self.ns["build_proto"].call_args_list[3].args[0], {1: "ME", 2: 1})
+        self.assertEqual(self.session.post.call_args_list[5].kwargs['headers']['Authorization'], 'Bearer initial-jwt')
+
+    def test_region_selection_failure_preserves_guest_credentials(self):
+        self.session.post.side_effect = [self.response({"data": {"uid": "7"}}), self.response({"access_token": "access", "open_id": "open"}), self.response(), self.response(), self.response(), self.response(status=403)]
+        self.ns["jwt_protocol"].parse_login_response.return_value = {"token": "fake-jwt", "account_id": "123"}
+        result = self.run_guest()
+        self.assertFalse(result["success"])
+        self.assertTrue(result["guest_created"])
+        self.assertEqual(result["password"], "original-password")
+        self.assertEqual(result["failed_stage"], "ChooseRegion")
+        self.assertEqual(result["http_status"], 403)
+        self.assertEqual(self.session.post.call_count, 6)
+
+    def test_final_login_must_confirm_region(self):
+        self.session.post.side_effect = [self.response({"data": {"uid": "7"}}), self.response({"access_token": "access", "open_id": "open"})] + [self.response() for _ in range(5)]
+        self.ns["jwt_protocol"].parse_login_response.return_value = {"token": "fake-jwt", "account_id": "123"}
+        result = self.run_guest()
+        self.assertFalse(result["success"])
+        self.assertEqual(result["failed_stage"], "MajorLogin after ChooseRegion")
+        self.assertIn('confirm the requested region', result['error_detail'])
+
+    def test_region_mismatch_keeps_credentials_without_creating_another_account(self):
+        import lssj
+        created = {"success": True, "guest_created": True, "region": "BR", "uid": "7", "password": "saved-password"}
+        with patch.object(lssj, "get_region_proxy_candidates", return_value=[None]), patch.object(lssj, "create_guest_account_with_proxy", return_value=created) as create:
+            result = lssj.create_guest_account("SG", "base", "prefix")
+        self.assertFalse(result["success"])
+        self.assertEqual(result["password"], "saved-password")
+        self.assertEqual(result["failed_stage"], "Region validation")
+        create.assert_called_once()
 
 
 class GuestActivationTests(unittest.TestCase):

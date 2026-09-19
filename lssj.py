@@ -7,6 +7,7 @@ import json
 import hashlib
 import hmac
 import guest_protocol
+import guest_registration
 import jwt_protocol
 from Crypto.Util.Padding import unpad
 import threading
@@ -460,7 +461,8 @@ def generate_custom_password(user_prefix):
     return "MEAN" + ''.join(random.choice('0123456789ABCDEF') for _ in range(60))
 
 def major_register_url(region, is_ghost=False):
-    return f"https://{guest_protocol.region_host(region, is_ghost)}/MajorRegister"
+    return (f"https://{guest_protocol.region_host(region, True)}/MajorRegister" if is_ghost
+            else "https://loginbp.ppmainecoonghj.com/MajorRegister")
 
 def major_login_url(region, is_ghost=False):
     return "https://loginbp.ppmainecoonghj.com/MajorLogin"
@@ -910,13 +912,10 @@ def create_guest_account(region, account_name, password_prefix, is_ghost=False):
                 result = create_guest_account_with_proxy(region, account_name, password_prefix, is_ghost, proxy_url)
                 actual_region = result.get("region")
                 if result.get("success") and not is_region_match(region, actual_region):
-                    errors.append({
-                        "uid": result.get("uid"),
-                        "requested_region": region,
-                        "actual_region": actual_region,
-                        "error": "Created account region did not match requested region.",
-                    })
-                    continue
+                    result.update(success=False, failed_stage="Region validation",
+                                  error="Created account region did not match requested region.")
+                    # Preserve the real account and credentials instead of creating
+                    # more accounts and losing the mismatched account's password.
                 return result
             except Exception as e:
                 errors.append({
@@ -950,15 +949,15 @@ def create_guest_account_with_proxy(region, account_name, password_prefix, is_gh
         values = {
             "Accept-Encoding": "gzip", "Connection": "Keep-Alive",
             "Content-Type": content_type, "Host": urlparse(url).netloc,
-            "User-Agent": guest_protocol.random_ua(),
+            "User-Agent": "GarenaMSDK/4.0.44(25028RN03A ;Android 15;ar;EG;app 1.132.1 2019121229;)",
         }
         if game:
-            values.update({"ReleaseVersion": "OB55", "X-GA": "v1 1",
-                           "X-Unity-Version": "2022.3.47f1", "Expect": "100-continue"})
+            values.update({"ReleaseVersion": jwt_protocol.RELEASE_VERSION, "X-GA": "v1 1",
+                           "X-Unity-Version": "2018.4.12f1", "Authorization": "Bearer",
+                           "User-Agent": "UnityPlayer/2018.4.12f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)",
+                           "Accept-Encoding": "deflate, gzip", "X-GA-SV": str(int(time.time()))})
         else:
             values["Accept"] = "application/json"
-        if url.endswith("/MajorLogin"):
-            values["Host"] = "loginbp.ggpolarbear.com"
         return with_region_ip_headers(values, region)
 
     with requests.Session() as session:
@@ -970,8 +969,12 @@ def create_guest_account_with_proxy(region, account_name, password_prefix, is_gh
             # Only token/login requests are retried automatically here.
             for attempt in range(3 if retry else 1):
                 try:
-                    response = session.post(url, headers=request_headers, timeout=30,
-                                            verify=False, **kwargs)
+                    if url.endswith("/api/v2/oauth/guest:register"):
+                        response = guest_registration.REGISTRATION_GATE.post(
+                            session, url, headers=request_headers, timeout=30, verify=False, **kwargs)
+                    else:
+                        response = session.post(url, headers=request_headers, timeout=30,
+                                                verify=False, **kwargs)
                     response.raise_for_status()
                     return response
                 except requests.RequestException as exc:
@@ -992,8 +995,12 @@ def create_guest_account_with_proxy(region, account_name, password_prefix, is_gh
             data = registration.get("data") if isinstance(registration, dict) else None
             uid = data.get("uid") if isinstance(data, dict) else None
             if not uid or registration.get("code", 0) != 0:
-                raise ValueError("Guest register did not return a successful UID")
-            result.update(success=True, guest_created=True, uid=uid)
+                failure = ValueError("Guest register did not return a successful UID")
+                # Application errors can arrive with HTTP 200. Keep the response
+                # so the caller can see the upstream code instead of a bare ValueError.
+                failure.response = response
+                raise failure
+            result.update(guest_created=True, uid=uid)
 
             stage = "Token grant"
             form_url = "https://100067.connect.garena.com/oauth/guest/token/grant"
@@ -1029,9 +1036,13 @@ def create_guest_account_with_proxy(region, account_name, password_prefix, is_gh
             keystream = bytes([0x30,0x30,0x30,0x32,0x30,0x31,0x37,0x30,0x30,0x30,0x30,0x30,0x32,0x30,0x31,0x37,0x30,0x30,0x30,0x30,0x30,0x32,0x30,0x31,0x37,0x30,0x30,0x30,0x30,0x30,0x32,0x30])
             field = bytes(ord(char) ^ keystream[index % len(keystream)] for index, char in enumerate(open_id))
             lang_code = "pt" if is_ghost else guest_protocol.REGION_LANG.get(region, "en")
-            payload = build_proto({1: name, 2: access_token, 3: open_id, 5: 102000007,
-                                   6: 4, 7: 1, 13: 1, 14: field, 15: lang_code,
-                                   16: 2, 20: "1.132.1", 21: 1})
+            register_fields = {1: name, 2: access_token, 3: open_id, 5: 102000007,
+                               6: 4, 7: 1, 13: 1, 14: field, 15: lang_code,
+                               16: 1, 17: 1}
+            if is_ghost:
+                register_fields.update({16: 2, 20: "1.132.1", 21: 1})
+                register_fields.pop(17)
+            payload = build_proto(register_fields)
             url = major_register_url(region, is_ghost)
             register_headers = headers(url, "application/x-www-form-urlencoded", game=True)
             register_headers["Authorization"] = "Bearer"
@@ -1043,23 +1054,7 @@ def create_guest_account_with_proxy(region, account_name, password_prefix, is_gh
             url = major_login_url(region, is_ghost)
             response = post(url, headers(url, "application/x-www-form-urlencoded", game=True), retry=True,
                             data=BmwNoiNoiBmvYasYas(G, F, login_payload))
-            candidates = []
-            try:
-                candidates.append(unpad(AES.new(G, AES.MODE_CBC, F).decrypt(response.content), AES.block_size))
-            except ValueError:
-                pass
-            candidates.append(response.content)
-            login = {}
-            for content in candidates:
-                try:
-                    res_msg = MajorLoginRes_pb2.MajorLoginRes()
-                    res_msg.ParseFromString(content)
-                    candidate = MessageToDict(res_msg, preserving_proto_field_name=True)
-                    if candidate.get("token"):
-                        login = candidate
-                        break
-                except message.DecodeError:
-                    continue
+            login = jwt_protocol.parse_login_response(response.content)
             jwt_token = login.get("token")
             if not jwt_token:
                 raise ValueError("MajorLogin did not return a JWT")
@@ -1067,14 +1062,58 @@ def create_guest_account_with_proxy(region, account_name, password_prefix, is_gh
             account_id = login.get("account_id") or jwt_data.get("account_id") or jwt_data.get("external_id")
             if not account_id:
                 raise ValueError("MajorLogin did not return an account ID")
-            actual_region = login.get("lock_region") or login.get("noti_region")
-            result.update(account_id=account_id, jwt_token=jwt_token, major_login=login,
+            actual_region = login.get("lock_region") or login.get("noti_region") or jwt_data.get("lock_region")
+            # A newly registered guest may have a JWT before choosing its region.
+            # Keep the provisional credentials if an onboarding request fails.
+            result.update(account_id=account_id, jwt_token=jwt_token)
+            if not is_ghost and (not actual_region or not is_region_match(region, actual_region)):
+                base_url = major_login_url(region, is_ghost).rsplit("/", 1)[0]
+                stage = "ChooseNewbieChoice"
+                choice_url = base_url + "/ChooseNewbieChoice"
+                choice_headers = headers(choice_url, "application/x-www-form-urlencoded", game=True)
+                choice_headers["Authorization"] = "Bearer " + jwt_token
+                choice_payload = build_proto({1: int(account_id), 2: 1, 3: 3})
+                post(choice_url, choice_headers, data=BmwNoiNoiBmvYasYas(G, F, choice_payload))
+
+                stage = "ChooseRegion"
+                choice_url = base_url + "/ChooseRegion"
+                choice_headers = headers(choice_url, "application/x-www-form-urlencoded", game=True)
+                choice_headers["Authorization"] = "Bearer " + jwt_token
+                region_code = {"EU": "EUROPE", "CIS": "RU"}.get(region, region)
+                choice_payload = build_proto({1: region_code, 2: 1})
+                post(choice_url, choice_headers, data=BmwNoiNoiBmvYasYas(G, F, choice_payload))
+
+                stage = "MajorLogin after ChooseRegion"
+                login_url = major_login_url(region, is_ghost)
+                response = post(login_url, headers(login_url, "application/x-www-form-urlencoded", game=True),
+                                retry=True, data=BmwNoiNoiBmvYasYas(G, F, login_payload))
+                login = jwt_protocol.parse_login_response(response.content)
+                jwt_token = login.get("token")
+                if not jwt_token:
+                    raise ValueError("Final MajorLogin did not return a JWT")
+                jwt_data = decode_jwt_payload(jwt_token)
+                final_account_id = login.get("account_id") or jwt_data.get("account_id") or jwt_data.get("external_id")
+                if str(final_account_id) != str(account_id):
+                    raise ValueError("Final MajorLogin returned a different or missing account ID")
+                actual_region = login.get("lock_region") or login.get("noti_region") or jwt_data.get("lock_region")
+                result["jwt_token"] = jwt_token
+                if not actual_region or not is_region_match(region, actual_region):
+                    raise ValueError("Final MajorLogin did not confirm the requested region")
+            if not actual_region:
+                raise ValueError("MajorLogin did not return the account region")
+            result.update(success=True, account_id=account_id, jwt_token=jwt_token, major_login=login,
                           major_login_success=True,
                           region=normalize_region(actual_region) if actual_region else requested_region)
             return result
         except Exception as exc:
             # Keep created credentials if a later stage fails; callers can recover them.
             response = getattr(exc, "response", None)
+            cooldown = getattr(exc, "retry_after_seconds", None)
+            if cooldown is None and response is not None:
+                cooldown = getattr(response, "registration_retry_after_seconds", None)
+            if isinstance(cooldown, (int, float)):
+                result["retry_after_seconds"] = cooldown
+                result["rate_limited"] = True
             reason = f"HTTP {response.status_code}" if response is not None else type(exc).__name__
             if response is not None:
                 result["http_status"] = response.status_code
@@ -1085,13 +1124,19 @@ def create_guest_account_with_proxy(region, account_name, password_prefix, is_gh
                         for field_name in ("code", "error", "message", "msg"):
                             value = error_data.get(field_name)
                             if isinstance(value, (str, int)):
-                                safe_value = str(value)[:300]
+                                safe_value = str(value)
                                 for secret in (password, result.get("access_token"), result.get("jwt_token")):
                                     if secret:
                                         safe_value = safe_value.replace(str(secret), "[redacted]")
-                                result.setdefault("upstream_error", {})[field_name] = safe_value
+                                result.setdefault("upstream_error", {})[field_name] = safe_value[:300]
                 except (ValueError, TypeError):
                     pass
+            if isinstance(exc, ValueError):
+                detail = str(exc)
+                for secret in (password, result.get("access_token"), result.get("jwt_token")):
+                    if secret:
+                        detail = detail.replace(str(secret), "[redacted]")
+                result["error_detail"] = detail[:300]
             message = f"{stage} failed ({reason})"
             if result["guest_created"]:
                 result["warning"] = "Guest created, but " + message
