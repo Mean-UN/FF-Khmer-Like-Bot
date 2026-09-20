@@ -284,7 +284,7 @@ class GuestGenerationTests(unittest.TestCase):
         context = Mock()
         context.__enter__ = Mock(return_value=self.session)
         context.__exit__ = Mock(return_value=False)
-        self.ns = dict(guest_protocol=guest_protocol, AES=AES, unpad=unpad, message=message, json=json, hashlib=hashlib, hmac=hmac, requests=SimpleNamespace(Session=Mock(return_value=context), RequestException=requests.RequestException),
+        self.ns = dict(jwt_protocol=SimpleNamespace(parse_login_response=Mock(return_value={"token": "fake-jwt", "account_id": "123", "lock_region": "ME"})), guest_protocol=guest_protocol, AES=AES, unpad=unpad, message=message, json=json, hashlib=hashlib, hmac=hmac, requests=SimpleNamespace(Session=Mock(return_value=context), RequestException=requests.RequestException),
                        generate_custom_password=Mock(return_value="original-password"),
                        generate_random_name=Mock(return_value="original-name"), normalize_region=lambda r: r.upper(),
                        urlparse=urlparse, USERAGENT="agent", with_region_ip_headers=lambda h, r: h,
@@ -296,7 +296,7 @@ class GuestGenerationTests(unittest.TestCase):
                        build_major_login_request=Mock(return_value=SimpleNamespace(SerializeToString=lambda: b"login")),
                        MajorLoginRes_pb2=SimpleNamespace(MajorLoginRes=Mock(return_value=Mock())),
                        MessageToDict=lambda *a, **kw: {"token": "fake-jwt", "account_id": "123", "lock_region": "ME"},
-                       decode_jwt_payload=lambda token: {}, time=SimpleNamespace(sleep=Mock()))
+                       decode_jwt_payload=lambda token: {}, time=SimpleNamespace(sleep=Mock(), time=lambda: 1789535859))
         exec(compile(ast.Module(body=[node], type_ignores=[]), "lssj.py", "exec"), self.ns)
 
     def response(self, data=None, status=200):
@@ -317,15 +317,28 @@ class GuestGenerationTests(unittest.TestCase):
         self.ns["generate_custom_password"].assert_called_once_with("prefix")
         self.ns["generate_random_name"].assert_called_once_with("base")
         fields = self.ns["build_proto"].call_args_list[0].args[0]
-        self.assertEqual((fields[1], fields[15], fields[16], fields[20]), ("original-name", "pt", 2, "1.132.1"))
+        self.assertEqual((fields[1], fields[15], fields[16], fields[17]), ("original-name", "pt", 1, 1))
         self.session.proxies.update.assert_called_once()
         login_fields = self.ns["build_proto"].call_args_list[1].args[0]
-        self.assertEqual((login_fields[7], login_fields[22], login_fields[26], login_fields[29]), ("1.132.3", "open", "BR", "access"))
+        self.assertEqual((login_fields[7], login_fields[22], login_fields[21], login_fields[29]), (b"1.114.13", "open", "pt", "access"))
+        self.assertNotIn(20, fields)
+        self.assertNotIn(21, fields)
+        for call in self.session.post.call_args_list[2:]:
+            headers = call.kwargs['headers']
+            self.assertEqual(headers['Host'], 'example.test')
+            self.assertEqual(headers['X-Unity-Version'], '2018.4.12f1')
+            self.assertEqual(headers['Authorization'], 'Bearer')
+            self.assertEqual(headers['X-GA-SV'], '1789535859')
+        token_request = self.session.post.call_args_list[1]
+        self.assertTrue(token_request.args[0].endswith('/api/v2/oauth/guest/token:grant'))
+        self.assertIn('device_id', json.loads(token_request.kwargs['data']))
+        self.assertEqual(token_request.kwargs['headers']['Authorization'], self.session.post.call_args_list[0].kwargs['headers']['Authorization'])
 
     def test_missing_token_fields_uses_fallback_endpoint(self):
         self.session.post.side_effect = [self.response({"data": {"uid": "7"}}), self.response({}), self.response({"data": {"access_token": "access", "open_id": "open"}}), self.response(), self.response()]
         self.assertTrue(self.run_guest()["major_login_success"])
-        self.assertIn("token:grant", self.session.post.call_args_list[2].args[0])
+        self.assertTrue(self.session.post.call_args_list[1].args[0].endswith("/api/v2/oauth/guest/token:grant"))
+        self.assertTrue(self.session.post.call_args_list[2].args[0].endswith("/oauth/guest/token/grant"))
 
     def test_registration_signature_matches_exact_sent_body(self):
         import hashlib
@@ -341,10 +354,10 @@ class GuestGenerationTests(unittest.TestCase):
 
     def test_reference_region_routes(self):
         import guest_protocol
-        self.assertEqual(guest_protocol.region_host("SG"), "loginbp.ggpolarbear.com")
-        self.assertEqual(guest_protocol.region_host("ME"), "loginbp.common.ggbluefox.com")
-        self.assertEqual(guest_protocol.region_host("BR"), "loginbp.ggblueshark.com")
-        self.assertEqual(guest_protocol.region_host("SG", True), "loginbp.ggblueshark.com")
+        self.assertEqual(guest_protocol.region_host("SG"), "loginbp.ppmainecoonghj.com")
+        self.assertEqual(guest_protocol.region_host("ME"), "loginbp.ppmainecoonghj.com")
+        self.assertEqual(guest_protocol.region_host("BR"), "loginbp.ppmainecoonghj.com")
+        self.assertEqual(guest_protocol.region_host("SG", True), "loginbp.ppmainecoonghj.com")
 
     def test_encrypted_login_and_external_id_fallback(self):
         from Crypto.Cipher import AES
@@ -353,13 +366,13 @@ class GuestGenerationTests(unittest.TestCase):
         plaintext = b"simulated-protobuf"
         response = self.response()
         response.content = AES.new(self.ns["G"], AES.MODE_CBC, self.ns["F"]).encrypt(pad(plaintext, 16))
-        self.ns["MessageToDict"] = lambda *a, **kw: {"token": "fake-jwt"}
+        self.ns["jwt_protocol"].parse_login_response.return_value = {"token": "fake-jwt"}
         self.ns["decode_jwt_payload"] = lambda token: {"external_id": "123"}
         self.session.post.side_effect = [self.response({"data": {"uid": "7"}}), self.response({"access_token": "access", "open_id": "open"}), self.response(), response]
         result = self.run_guest()
         self.assertTrue(result["major_login_success"])
         self.assertEqual(result["account_id"], "123")
-        self.ns["MajorLoginRes_pb2"].MajorLoginRes.return_value.ParseFromString.assert_called_once_with(plaintext)
+        self.ns["jwt_protocol"].parse_login_response.assert_called_once_with(response.content)
 
     def test_major_register_failure_keeps_credentials_and_stops_login(self):
         self.session.post.side_effect = [self.response({"data": {"uid": "7"}}), self.response({"access_token": "access", "open_id": "open"}), self.response(status=500)]
@@ -437,6 +450,7 @@ class GuestActivationTests(unittest.TestCase):
         self.session.post.side_effect = responses
         self.assertTrue(self.module.activate_guest("123", "secret", "ME")["success"])
         self.assertEqual(self.session.post.call_args_list[1].args[0], "https://loginbp.ppmainecoonghj.com/MajorLogin")
+        self.assertNotIn("Host", self.session.post.call_args_list[1].kwargs["headers"])
 
     def test_no_login_data_is_not_success(self):
         self.configure(login_data=b"")

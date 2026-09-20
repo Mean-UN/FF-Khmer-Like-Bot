@@ -13,7 +13,7 @@ class BioTests(unittest.TestCase):
         return 'eyJhbGciOiJIUzI1NiJ9.' + payload + '.signature'
 
     def test_regions_payload_and_headers(self):
-        for region, host in [('SG','clientbp.ggblueshark.com'), ('BR','client.us.freefiremobile.com'), ('IND','client.ind.freefiremobile.com')]:
+        for region, host in [('SG','clientbp.ppmainecoonghj.com'), ('BD','clientbp.ppmainecoonghj.com'), ('BR','client.us.freefiremobile.com'), ('IND','client.ind.freefiremobile.com')]:
             session = Mock()
             with patch.object(lssj,'http_session',session):
                 lssj.update_social_bio(self.token(region),'hello')
