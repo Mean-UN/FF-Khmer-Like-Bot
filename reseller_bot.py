@@ -3,10 +3,12 @@ import os
 import json
 import threading
 import re
+from html import escape
 from datetime import date
 
 from reseller_pricing import PACKAGE_PRICES_CENTS, format_usd, package_price_cents
 from reseller_store import ResellerStore, SellerError
+from reseller_api import uid_lock
 
 
 class ResellerFeatures:
@@ -14,14 +16,53 @@ class ResellerFeatures:
         self.core = core
         self.store = ResellerStore(os.path.join(core.BASE_DIR, "resellers.sqlite3"))
         self.owner_alert_wakeup = threading.Event()
+        self.owner_alert_lock = threading.Lock()
+
+    def api_group_alerts(self, event, report):
+        with self.store.db() as db:
+            row = db.execute("SELECT result FROM reseller_api_jobs WHERE event_id=?", (event['event_id'],)).fetchone()
+        result = json.loads(row['result']) if row and row['result'] else {}
+        sections = []
+        delivery = result.get('delivery')
+        if delivery is not None:
+            def value(key):
+                return escape(str(delivery.get(key) if delivery.get(key) is not None else 'N/A'))
+            sections.append('\n'.join([
+                '✅ Like Request Processed Successfully', '━━━━━━━━━━━━━━━━━━',
+                f"👤 Name: {value('PlayerNickname')}", f"🆔 UID: {event['uid']}",
+                f"🌍 Region: {value('Region')}", f"👍 Likes Before: {value('LikesbeforeCommand')}",
+                f"➕ Likes Added: {result.get('delivered', 0)}", f"❤️ Total Now: {value('LikesafterCommand')}",
+                f"📌 Requests Left: {report['remaining']}", '━━━━━━━━━━━━━━━━━━',
+                '💥 Daily 220 Likes!', '🚀 Contact @Mean_Un to purchase Likes.']))
+        order = result.get('order')
+        if order:
+            if result.get('action') == 'extended':
+                sections.append(self.core.format_autolike_order(order, title='✅ AUTOLIKEFF ORDER EXTENDED', kind='likeff'))
+            else:
+                sections.append('\n'.join([
+                    '✅ AUTOLIKEFF ORDER CREATED', '━━━━━━━━━━━━━━━━━━━━━━━━',
+                    f"🧾 Order ID: {order['order_id']}", f"🆔 UID: {order['uid']}",
+                    f"👤 Telegram User: {escape(str(order.get('telegram_user_name') or event['name']))}",
+                    f"🎯 Total Likes: {order['total_likes']:,}",
+                    '⏳ First delivery is processing now.' if order.get('immediate_first_delivery') else
+                    '✅ Added to AutoLikeFF. Delivery starts tomorrow.']))
+        return sections or ['✅ AUTOLIKEFF PURCHASE PROCESSED\n🆔 UID: ' + event['uid']]
 
     def send_owner_alerts(self):
+        with self.owner_alert_lock:
+            self._send_owner_alerts()
+
+    def _send_owner_alerts(self):
         owner_id = getattr(self.core, "OWNER_ID", 0)
-        if not owner_id:
-            return
         for event in self.store.pending_owner_alerts():
             try:
-                report = self.store.report(event["user_id"], event["day"])[0]
+                destinations = [str(owner_id)] if owner_id else []
+                if event["event_id"].startswith("api:"):
+                    destinations.extend(str(group) for group in getattr(self.core, "load_autolike_groups", lambda: [])())
+                destinations = list(dict.fromkeys(destinations))
+                if not destinations:
+                    continue
+                report = self.store.alert_report(event)
                 labels = {"likeff": "LIKEFF", "autolikeff": "AUTOLIKEFF ORDER", "autolikeff_extend": "AUTOLIKEFF EXTENSION"}
                 lines = ["🔔 RESELLER REQUEST SUCCESS", "━━━━━━━━━━━━━━━━━━━━",
                          f"👤 {event['name']}", f"🆔 Telegram: {event['user_id']}",
@@ -34,11 +75,22 @@ class ResellerFeatures:
                 lines.extend([f"💵 Charge: {format_usd(event['cents'])}",
                               f"🎟 Requests left now: {report['remaining']}",
                               f"📅 Bill date: {event['day']}", f"💵 Daily total: {format_usd(report['cents'])}"])
-                self.core.bot.send_message(int(owner_id), "\n".join(lines), parse_mode=None)
+                for chat_id in destinations:
+                    if self.store.alert_delivered(event["event_id"], chat_id):
+                        continue
+                    is_group = event['event_id'].startswith('api:') and chat_id != str(owner_id)
+                    messages = self.api_group_alerts(event, report) if is_group else ["\n".join(lines)]
+                    for index, text in enumerate(messages):
+                        receipt = f"{chat_id}:part:{index}"
+                        if self.store.alert_delivered(event['event_id'], receipt):
+                            continue
+                        self.core.bot.send_message(int(chat_id), text, parse_mode='HTML' if is_group else None)
+                        self.store.record_alert_delivery(event['event_id'], receipt)
+                    self.store.record_alert_delivery(event["event_id"], chat_id)
                 self.store.owner_alert_sent(event["event_id"])
             except Exception as exc:
-                self.core.logger.warning("Reseller owner alert failed; will retry: %s", exc)
-                break
+                self.core.logger.warning("Reseller owner alert %s failed; will retry: %s", event['event_id'], exc, exc_info=True)
+                continue
 
     def process_owner_alerts(self):
         while True:
@@ -169,12 +221,16 @@ class ResellerFeatures:
                 if not any(item["event_id"] == key for item in extensions):
                     offset = int(target["total_likes"])
                     target["total_likes"] = offset + extension["likes"]
-                    extensions.append({"event_id": key, "offset": offset})
+                    extensions.append({"event_id": key, "offset": offset,
+                                       "initial_likes": extension.get("initial_likes", 0)})
                     target["extended_at"] = extension["created_at"]
                     target.pop("remove_after_save", None)
                     if target.get("status") == "completed":
                         target["status"] = "active"
                         target["next_run_date"] = self.core.next_autolike_run_date(kind="likeff")
+                    if extension.get("next_run_date"):
+                        target["next_run_date"] = max(target.get("next_run_date") or "", extension["next_run_date"])
+                        target["last_attempt_period"] = extension["last_attempt_period"]
                 continue
             if key not in existing:
                 orders.append(order)
@@ -229,7 +285,7 @@ class ResellerFeatures:
                 raise SellerError("UID must be a positive 64-bit number")
             package_price_cents(package)
             key = self.key(message)
-            with self.core.autolike_lock:
+            with uid_lock(uid), self.core.autolike_lock:
                 orders = self.core.load_autolike_orders("likeff")
                 existing_order = self.core.find_existing_autolike_order(orders, uid)
                 if existing_order:
@@ -285,7 +341,7 @@ class ResellerFeatures:
             uid, package = str(int(parts[1])), int(parts[2])
             package_price_cents(package)
             key = self.key(message)
-            with self.core.autolike_lock:
+            with uid_lock(uid), self.core.autolike_lock:
                 orders = self.core.load_autolike_orders("likeff")
                 target = next((order for order in orders if str(order.get("uid")) == uid
                                and order.get("seller_event_id")

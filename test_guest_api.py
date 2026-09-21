@@ -1,6 +1,7 @@
 """Guest API integration with real request encoding and response parsing."""
 import base64
 import json
+import os
 import unittest
 from unittest.mock import Mock, patch
 
@@ -9,6 +10,66 @@ from proto import MajorLoginRes_pb2
 
 
 class GuestApiTests(unittest.TestCase):
+    def test_reference_cookies_are_scoped_to_oauth_requests(self):
+        raw = MajorLoginRes_pb2.MajorLoginRes(
+            account_id=456, token='test-token', lock_region='SG').SerializeToString()
+        with patch.dict(os.environ, {'GUEST_REGISTER_COOKIE': 'datadome=register',
+                                     'GUEST_TOKEN_COOKIE': 'datadome=token'}):
+            response, session = self.run_flow(raw)
+        self.assertTrue(response.json['success'])
+        calls = session.post.call_args_list
+        self.assertEqual(calls[0].kwargs['headers']['Cookie'], 'datadome=register')
+        self.assertEqual(calls[1].kwargs['headers']['Cookie'], 'datadome=token')
+        for call in calls[2:]:
+            self.assertNotIn('Cookie', call.kwargs['headers'])
+
+    def test_explicit_empty_cookie_disables_reference_value(self):
+        with patch.dict(os.environ, {'GUEST_REGISTER_COOKIE': '', 'GUEST_TOKEN_COOKIE': ''}):
+            self.assertEqual(lssj.guest_protocol.oauth_cookie('register'), '')
+            self.assertEqual(lssj.guest_protocol.oauth_cookie('token'), '')
+
+    def test_registration_read_timeout_is_unknown_and_not_retried(self):
+        session = Mock()
+        session.post.side_effect = lssj.requests.ReadTimeout()
+        with patch.object(lssj.requests, 'Session') as factory:
+            factory.return_value.__enter__.return_value = session
+            response = lssj.app.test_client().post('/createaccount', json={
+                'region': 'SG', 'name': 'Example'})
+        self.assertEqual(response.json['error_code'], 'upstream_read_timeout')
+        self.assertTrue(response.json['registration_outcome_unknown'])
+        self.assertNotIn('http_status', response.json)
+        self.assertEqual(session.post.call_count, 1)
+
+    def test_registration_rate_limit_reports_retry_after_without_retry(self):
+        session = Mock()
+        reply = Mock(status_code=429, headers={'Retry-After': '60'})
+        reply.json.return_value = {'code': 1006, 'error': 'error_too_many_requests'}
+        reply.raise_for_status.side_effect = lssj.requests.HTTPError(response=reply)
+        session.post.return_value = reply
+        with patch.object(lssj.requests, 'Session') as factory:
+            factory.return_value.__enter__.return_value = session
+            response = lssj.app.test_client().post('/createaccount', json={
+                'region': 'SG', 'name': 'Example'})
+        self.assertEqual(response.json['error_code'], 'upstream_rate_limited')
+        self.assertEqual(response.json['retry_after'], '60')
+        self.assertIn('rate limit', response.json['error'])
+        self.assertEqual(session.post.call_count, 1)
+
+    def test_token_timeout_does_not_report_registration_status(self):
+        session = Mock()
+        registration = Mock(status_code=200)
+        registration.json.return_value = {'code': 0, 'data': {'uid': '123'}}
+        session.post.side_effect = [registration] + [lssj.requests.Timeout()] * 6
+        with patch.object(lssj.requests, 'Session') as factory, patch.object(lssj.time, 'sleep'):
+            factory.return_value.__enter__.return_value = session
+            response = lssj.app.test_client().post('/createaccount', json={
+                'region': 'SG', 'name': 'Example'})
+        self.assertTrue(response.json['guest_created'])
+        self.assertEqual(response.json['uid'], '123')
+        self.assertEqual(response.json['failed_stage'], 'Token grant')
+        self.assertNotIn('http_status', response.json)
+        self.assertNotIn('HTTP 200', response.json['warning'])
+
     def test_registration_application_error_exposes_code_without_password(self):
         session = Mock()
         reply = Mock(status_code=200)

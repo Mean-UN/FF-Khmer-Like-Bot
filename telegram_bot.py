@@ -15,6 +15,7 @@ from html import escape
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from reseller_bot import ResellerFeatures
+from reseller_api import run_worker as run_reseller_api_worker
 from token_refresh_alerts import TokenRefreshAlerts, refresh_all, failure_report, coalesced_refresh
 
 import requests
@@ -1205,7 +1206,7 @@ def format_autolike_order(order, title=None, kind="likeff"):
     sent, total, remaining = autolike_order_status(order)
     telegram_user = autolike_order_user_display(order, html=True)
     run_hour, run_minute = autolike_run_time(kind)
-    return "\n".join([
+    lines = [
         title,
         "━━━━━━━━━━━━━━━━━━",
         f"🧾 Order ID: {order.get('order_id', 'N/A')}",
@@ -1216,7 +1217,10 @@ def format_autolike_order(order, title=None, kind="likeff"):
         f"⏳ Remaining: {max(0, remaining):,}",
         f"📌 Status: {order.get('status', 'active')}",
         f"🕘 Next Run: {order.get('next_run_date', 'N/A')} {run_hour:02d}:{run_minute:02d} Cambodia",
-    ])
+    ]
+    if "ORDER EXTENDED" in title:
+        lines = lines[:-2]
+    return "\n".join(lines)
 
 
 def format_autolike_list(orders, kind="likeff"):
@@ -1472,7 +1476,10 @@ def notify_autolike_order(order, group_text, private_text=None):
         except Exception as exc:
             logger.warning("Reseller delivery notification failed: %s", exc)
     group_id = order.get("group_id")
-    if group_id:
+    group_ids = [str(group_id)] if group_id else []
+    if str(order.get("seller_event_id") or "").startswith("api:"):
+        group_ids.extend(load_autolike_groups())
+    for group_id in dict.fromkeys(group_ids):
         try:
             active_bot.send_message(int(group_id), group_text, parse_mode=None)
         except Exception as exc:
@@ -1585,53 +1592,69 @@ def deliver_autolikeff_order(order, period=None, schedule_next=True, notify_fail
 
 
 def deliver_autolike_order_now(order_id, kind="likeff", period=None, expected_order=None):
-    scheduled = period is not None
-    period = period or current_autolike_period()
+    from reseller_api import uid_lock
+    # Resolve the UID without holding the global lock while waiting for its lock.
     with autolike_lock:
-        orders = load_autolike_orders(kind)
-        target_order = next((order for order in orders if str(order.get("order_id")) == str(order_id)), None)
-        if not target_order or target_order.get("status") != "active":
+        candidates = load_autolike_orders(kind)
+        candidate = next((item for item in candidates if str(item.get("order_id")) == str(order_id)), None)
+        if not candidate:
             return False
-        identity_fields = ("uid", "created_at", "seller_event_id")
-        if expected_order and any(target_order.get(key) != expected_order.get(key) for key in identity_fields):
-            return False
-        if target_order.get("last_attempt_period") == period or target_order.get("last_period") == period:
-            return False
-        if scheduled and (target_order.get("next_run_date") or period) > period:
-            return False
-        # Persist the claim before calling the API so the immediate-delivery
-        # thread and scheduled worker cannot submit the same order together.
-        target_order["last_attempt_period"] = period
-        save_autolike_orders(orders, kind)
+        delivery_uid = candidate.get("uid") or "0"
+        expected_order = expected_order or dict(candidate)
+    delivery_lock = uid_lock(delivery_uid)
+    if not delivery_lock.acquire(blocking=False):
+        return False
     try:
-        deliver_autolike_order(target_order, kind, period=period, schedule_next=True)
-    finally:
+        scheduled = period is not None
+        period = period or current_autolike_period()
         with autolike_lock:
-            current = load_autolike_orders(kind)
-            for index, order in enumerate(current):
-                if str(order.get("order_id")) != str(order_id):
-                    continue
-                if any(order.get(key) != target_order.get(key) for key in identity_fields):
+            orders = load_autolike_orders(kind)
+            target_order = next((order for order in orders if str(order.get("order_id")) == str(order_id)), None)
+            if not target_order or target_order.get("status") != "active":
+                return False
+            identity_fields = ("uid", "created_at", "seller_event_id")
+            if expected_order and any(target_order.get(key) != expected_order.get(key) for key in identity_fields):
+                return False
+            if target_order.get("last_attempt_period") == period or target_order.get("last_period") == period:
+                return False
+            if scheduled and (target_order.get("next_run_date") or period) > period:
+                return False
+            # Persist the claim before calling the API so the immediate-delivery
+            # thread and scheduled worker cannot submit the same order together.
+            target_order["last_attempt_period"] = period
+            save_autolike_orders(orders, kind)
+        try:
+            deliver_autolike_order(target_order, kind, period=period, schedule_next=True)
+        finally:
+            with autolike_lock:
+                current = load_autolike_orders(kind)
+                for index, order in enumerate(current):
+                    if str(order.get("order_id")) != str(order_id):
+                        continue
+                    if any(order.get(key) != target_order.get(key) for key in identity_fields):
+                        break
+                    if order.get("status") == "cancelled":
+                        break
+                    # Preserve owner extensions made while the request was running.
+                    target_order["total_likes"] = order["total_likes"]
+                    for field in ("seller_extensions", "extended_at"):
+                        if field in order:
+                            target_order[field] = order[field]
+                    if autolike_order_status(target_order)[2] > 0:
+                        target_order.pop("remove_after_save", None)
+                        target_order["status"] = "active"
+                    if target_order.get("remove_after_save"):
+                        current.pop(index)
+                    else:
+                        current[index] = target_order
+                    save_autolike_orders(current, kind)
+                    if target_order.get("seller_event_id"):
+                        resellers.store.record_order(target_order)
                     break
-                if order.get("status") == "cancelled":
-                    break
-                # Preserve owner extensions made while the request was running.
-                target_order["total_likes"] = order["total_likes"]
-                for field in ("seller_extensions", "extended_at"):
-                    if field in order:
-                        target_order[field] = order[field]
-                if autolike_order_status(target_order)[2] > 0:
-                    target_order.pop("remove_after_save", None)
-                    target_order["status"] = "active"
-                if target_order.get("remove_after_save"):
-                    current.pop(index)
-                else:
-                    current[index] = target_order
-                save_autolike_orders(current, kind)
-                if target_order.get("seller_event_id"):
-                    resellers.store.record_order(target_order)
-                break
-    return True
+        return True
+
+    finally:
+        delivery_lock.release()
 
 
 def deliver_autolikeff_order_now(order_id):
@@ -3431,33 +3454,38 @@ def guest_account_record(data):
 
 def generate_and_activate_guest(region, name, progress=None):
     last_error = "Guest account generation failed"
-    for _ in range(5):
-        try:
-            data = call_api("createaccount", {"region": region, "name": name})
-            if not data.get("uid") or not data.get("password"):
-                last_error = data.get("error") or "Guest account generation failed"
-                continue
-            account_id = str(data.get("account_id") or "").strip()
-            if not account_id.isascii() or not account_id.isdigit() or int(account_id) <= 0:
-                last_error = "Account ID missing; could not generate a valid replacement after 5 attempts"
-                continue
-            # Preserve created credentials even if activation fails; don't create
-            # a replacement account just because the activation server is down.
+    try:
+        data = call_api("createaccount", {"region": region, "name": name}, timeout=360)
+        if not data.get("uid") or not data.get("password"):
+            last_error = data.get("error") or "Guest account generation failed"
+            return None, last_error
+        account_id = str(data.get("account_id") or "").strip()
+        if not account_id.isascii() or not account_id.isdigit() or int(account_id) <= 0:
             record = guest_account_record(data)
+            record["activated"] = False
+            record["activation_error"] = (data.get("warning") or data.get("error")
+                or "Account ID missing; guest credentials preserved")
+            record["failed_stage"] = data.get("failed_stage")
             if progress:
                 progress("created")
-            try:
-                activation = activate_guest(record["uid"], record["password"], region=record.get("region") or region)
-            except Exception as exc:
-                activation = {"success": False, "error": f"Activation failed ({type(exc).__name__})"}
-            record["activated"] = bool(activation.get("success"))
-            if record["activated"] and progress:
-                progress("activated")
-            if not record["activated"]:
-                record["activation_error"] = activation.get("error") or "Activation failed"
             return record, None
+        # Preserve created credentials even if activation fails; don't create
+        # a replacement account just because the activation server is down.
+        record = guest_account_record(data)
+        if progress:
+            progress("created")
+        try:
+            activation = activate_guest(record["uid"], record["password"], region=record.get("region") or region)
         except Exception as exc:
-            last_error = f"Guest generation failed ({type(exc).__name__})"
+            activation = {"success": False, "error": f"Activation failed ({type(exc).__name__})"}
+        record["activated"] = bool(activation.get("success"))
+        if record["activated"] and progress:
+            progress("activated")
+        if not record["activated"]:
+            record["activation_error"] = activation.get("error") or "Activation failed"
+        return record, None
+    except Exception as exc:
+        last_error = f"Guest generation failed ({type(exc).__name__})"
     return None, last_error
 
 
@@ -3505,6 +3533,8 @@ def process_guestgen(message, region, name, total=None, file_mode=False):
         text = format_guestgen(accounts[0])
         if accounts[0]["activated"]:
             text += "\n\n✅ Guest activated"
+        else:
+            text += "\n\n⚠️ " + escape(str(accounts[0].get("activation_error") or "Guest not activated"))
         bot.edit_message_text(chat_id=status_msg.chat.id, message_id=status_msg.message_id, text=text[:3900], parse_mode="HTML")
         extra = text[3900:]
         while extra:
@@ -5216,6 +5246,7 @@ if __name__ == "__main__":
     if not acquire_bot_instance_lock():
         raise SystemExit(1)
     threading.Thread(target=resellers.process_owner_alerts, daemon=True).start()
+    threading.Thread(target=run_reseller_api_worker, args=(resellers,), daemon=True).start()
     threading.Thread(target=reset_limits, daemon=True).start()
     threading.Thread(target=process_autolike_orders, args=("like",), daemon=True).start()
     threading.Thread(target=process_autolikeff_orders, daemon=True).start()

@@ -6,6 +6,13 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.venv/
+venv/
+env/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
 build/
 dist/
 *.egg-info/
@@ -23,6 +30,7 @@ uidpass.json
 uidpass_likeff.json
 uidpass_likeff_*.json
 autolikeff_orders.json
+autolike_orders.json
 autolikeff_groups.json
 telegram_users.json
 regions.json
@@ -35,14 +43,32 @@ resellers.sqlite3-*
 token_refresh_alerts.sqlite3
 token_refresh_alerts.sqlite3-*
 Guest-*.json
+guestgen-check-*.json
+rixor.json
+ldr-activated-success.json
+
+# Runtime databases and SQLite transaction files
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
 
 # Logs and temporary files
 *.log
+*.log.*
 *.tmp
 *.bak
+*.sqlite3.*
+*.sqlite.*
+*.db.*
 
 # Editor/OS files
 .vscode/
 .idea/
 Thumbs.db
 Desktop.ini
+.DS_Store

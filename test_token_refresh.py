@@ -411,7 +411,7 @@ class GuestActivationTests(unittest.TestCase):
 
     def test_activation_requires_all_three_steps(self):
         self.configure()
-        result = self.module.activate_guest("123", "secret")
+        result = self.module.activate_guest_direct("123", "secret")
         self.assertTrue(result["success"])
         self.assertEqual(self.session.post.call_count, 3)
         call = self.session.post.call_args
@@ -433,14 +433,14 @@ class GuestActivationTests(unittest.TestCase):
     def test_major_login_value_error_retries_same_account_five_times(self):
         failure = {"success": False, "error": "MajorLogin failed (ValueError)", "retryable": True}
         with patch.object(self.module, "_activate_guest_once", return_value=failure) as once, patch.object(self.module.time, "sleep") as sleep:
-            self.assertFalse(self.module.activate_guest("123", "secret", "SG")["success"])
+            self.assertFalse(self.module.activate_guest_direct("123", "secret", "SG")["success"])
         self.assertEqual(once.call_count, 5)
         self.assertTrue(all(c.args == ("123", "secret", "SG") for c in once.call_args_list))
         self.assertEqual(sleep.call_count, 4)
 
     def test_retry_stops_on_success(self):
         with patch.object(self.module, "_activate_guest_once", side_effect=[{"success": False, "retryable": True}, {"success": True}]) as once, patch.object(self.module.time, "sleep"):
-            self.assertTrue(self.module.activate_guest("123", "secret")["success"])
+            self.assertTrue(self.module.activate_guest_direct("123", "secret")["success"])
         self.assertEqual(once.call_count, 2)
 
     def test_encrypted_login_and_region_host(self):
@@ -448,17 +448,17 @@ class GuestActivationTests(unittest.TestCase):
         responses = list(self.session.post.side_effect)
         responses[1].content = self.module.AES.new(self.module.aes_key, self.module.AES.MODE_CBC, self.module.aes_iv).encrypt(self.module.pad(responses[1].content, 16))
         self.session.post.side_effect = responses
-        self.assertTrue(self.module.activate_guest("123", "secret", "ME")["success"])
+        self.assertTrue(self.module.activate_guest_direct("123", "secret", "ME")["success"])
         self.assertEqual(self.session.post.call_args_list[1].args[0], "https://loginbp.ppmainecoonghj.com/MajorLogin")
         self.assertNotIn("Host", self.session.post.call_args_list[1].kwargs["headers"])
 
     def test_no_login_data_is_not_success(self):
         self.configure(login_data=b"")
-        self.assertFalse(self.module.activate_guest("123", "secret")["success"])
+        self.assertFalse(self.module.activate_guest_direct("123", "secret")["success"])
 
     def test_untrusted_server_never_receives_token(self):
         self.configure(server="https://example.org")
-        self.assertFalse(self.module.activate_guest("123", "secret")["success"])
+        self.assertFalse(self.module.activate_guest_direct("123", "secret")["success"])
         self.assertEqual(self.session.post.call_count, 2)
 
     def test_json_formats_and_duplicates(self):
@@ -489,7 +489,16 @@ class GuestActivationTests(unittest.TestCase):
         api.assert_called_once()
         activate.assert_called_once_with("123", "secret", region="SG")
 
-    def test_guestgen_replaces_missing_account_id(self):
+        api.reset_mock()
+        api.return_value = {"success": False, "error": "API timeout after 360 seconds"}
+        activate.reset_mock()
+        account, error = ns["generate_and_activate_guest"]("SG", "name")
+        self.assertIsNone(account)
+        self.assertIn("timeout", error)
+        api.assert_called_once_with("createaccount", {"region": "SG", "name": "name"}, timeout=360)
+        activate.assert_not_called()
+
+    def test_guestgen_preserves_missing_account_id(self):
         tree = ast.parse(Path("telegram_bot.py").read_text(encoding="utf-8-sig"))
         nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in ("guest_account_record", "generate_and_activate_guest")]
         invalid = {"uid": "123", "password": "secret", "account_id": None}
@@ -500,17 +509,13 @@ class GuestActivationTests(unittest.TestCase):
         exec(compile(ast.Module(body=nodes, type_ignores=[]), "telegram_bot.py", "exec"), ns)
         progress = Mock()
         record, error = ns["generate_and_activate_guest"]("SG", "name", progress)
-        self.assertEqual(record["uid"], "124")
+        self.assertEqual(record["uid"], "123")
         self.assertIsNone(error)
-        activate.assert_called_once_with("124", "secret", region="SG")
-        self.assertEqual([c.args[0] for c in progress.call_args_list], ["created", "activated"])
-        api.side_effect = None
-        api.return_value = invalid
-        activate.reset_mock()
-        record, error = ns["generate_and_activate_guest"]("SG", "name")
-        self.assertIsNone(record)
-        self.assertIn("5 attempts", error)
+        self.assertFalse(record["activated"])
+        self.assertIn("credentials preserved", record["activation_error"])
+        api.assert_called_once()
         activate.assert_not_called()
+        self.assertEqual([c.args[0] for c in progress.call_args_list], ["created"])
 
     def test_bulk_guestgen_three_workers_and_memory_output(self):
         from concurrent.futures import as_completed

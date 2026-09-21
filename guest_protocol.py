@@ -1,8 +1,21 @@
 """Guest creation protocol fields from the supplied reference implementation."""
 
+import os
 import random
 
 import time
+
+# Defaults supplied by the reference client; deployments can replace or clear them.
+REGISTER_COOKIE = "datadome=oYpIhVco_RFvLHe_T9KFd5wuY0gcQuNfrlt4rHJY5QOkwv4TGt8gPMK32MbHuBdzJyfXnXlfzNZT_2tHr2kys8AMYT2~T71QP1S78_7Pdx4JLOXdSrflPT6cOX2vsyJh"
+TOKEN_COOKIE = "datadome=y23Z3X17pgkMHEt5zY8dqxC6BIf7WJMgC0RXNbqifHT7t9zajKe_hegFb1Ie9_7JixXpz7FRGVodOn~mWPk_NrqIIhUOXDYqKOahzoRQcyEy77GWEMcdA9_MqPJeM5qv"
+
+
+def oauth_cookie(stage):
+    if stage == "register":
+        return os.environ.get("GUEST_REGISTER_COOKIE", REGISTER_COOKIE).strip()
+    if stage == "token":
+        return os.environ.get("GUEST_TOKEN_COOKIE", TOKEN_COOKIE).strip()
+    raise ValueError("Unknown guest OAuth stage")
 
 REGION_LANG = {"ME":"ar","IND":"hi","ID":"id","VN":"vi","TH":"th","BD":"bn","PK":"ur","TW":"zh","CIS":"ru","SAC":"es","BR":"pt"}
 

@@ -225,6 +225,27 @@ class ResellerBotTests(unittest.TestCase):
         self.features.send_owner_alerts()
         self.bot.send_message.assert_called_once()
 
+    def test_alert_survives_removed_seller_profile(self):
+        self.features.manual_call(self.message, {"uid": "123"})
+        with self.features.store.db() as db:
+            db.execute("DELETE FROM sellers WHERE user_id='7'")
+        self.features.send_owner_alerts()
+        self.bot.send_message.assert_called_once()
+        text = self.bot.send_message.call_args.args[1]
+        self.assertIn('Dara Sok', text)
+        self.assertIn('N/A (seller record missing)', text)
+        self.assertIn('Daily total: $0.20', text)
+        self.assertEqual(self.features.store.pending_owner_alerts(), [])
+
+    def test_failed_alert_does_not_block_later_purchase(self):
+        self.features.manual_call(self.message, {"uid": "123"})
+        self.message.message_id = 2
+        self.features.manual_call(self.message, {"uid": "456"})
+        self.bot.send_message.side_effect = [RuntimeError('offline'), None]
+        self.features.send_owner_alerts()
+        self.assertEqual(self.bot.send_message.call_count, 2)
+        self.assertEqual(len(self.features.store.pending_owner_alerts()), 1)
+
     def test_owner_alerts_for_order_and_extension_not_each_delivery(self):
         self.message.text = "/autolikeff 123 1000"
         with patch("reseller_bot.threading.Thread"):

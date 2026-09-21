@@ -35,6 +35,26 @@ from google.protobuf import symbol_database as _symbol_database
 from google.protobuf.internal import builder as _builder
 from Crypto.Cipher import AES
 
+
+def load_api_env():
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if not os.path.isfile(path):
+        return
+    with open(path, encoding="utf-8-sig") as env_file:
+        for line in env_file:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key, value = key.strip(), value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+                value = value[1:-1]
+            if key:
+                os.environ.setdefault(key, value)
+
+
+load_api_env()
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 G = bytes([89, 103, 38, 116, 99, 37, 68, 69, 117, 104, 54, 37, 90, 99, 94, 56])
@@ -44,6 +64,9 @@ REGNS = {"IND", "BR", "US", "SAC", "NA", "SG", "RU", "ID", "TW", "VN", "TH", "ME
 FAHHHH = Flask(__name__)
 CORS(FAHHHH)
 app = FAHHHH
+from reseller_api import install_reseller_api
+from reseller_store import ResellerStore
+install_reseller_api(FAHHHH, ResellerStore(os.path.join(os.path.dirname(os.path.abspath(__file__)), "resellers.sqlite3")))
 install_request_usage(FAHHHH)
 if hasattr(FAHHHH, "json"):
     FAHHHH.json.sort_keys = False
@@ -846,6 +869,7 @@ def create_guest_account(region, account_name, password_prefix, is_ghost=False):
 
 
 def create_guest_account_with_proxy(region, account_name, password_prefix, is_ghost=False, proxy_url=None):
+    from requests.exceptions import ConnectTimeout, ReadTimeout
     # Preserve the existing naming/password generators, including GHOST mode.
     password = generate_custom_password(password_prefix)
     region = normalize_region(region)
@@ -880,9 +904,11 @@ def create_guest_account_with_proxy(region, account_name, password_prefix, is_gh
             session.proxies.update({"http": proxy_url, "https": proxy_url})
 
         def post(url, request_headers, retry=False, **kwargs):
+            nonlocal response
             # Registration may create an account even when its response is lost.
             # Only token/login requests are retried automatically here.
             for attempt in range(3 if retry else 1):
+                response = None
                 try:
                     response = session.post(url, headers=request_headers, timeout=30,
                                             verify=False, **kwargs)
@@ -901,6 +927,9 @@ def create_guest_account_with_proxy(region, account_name, password_prefix, is_gh
             signature = hmac.new(CLIENT_SECRET.encode("utf-8"), register_body, hashlib.sha256).hexdigest()
             register_headers = headers(register_url, "application/json; charset=utf-8")
             register_headers["Authorization"] = f"Signature {signature}"
+            register_cookie = guest_protocol.oauth_cookie("register")
+            if register_cookie:
+                register_headers["Cookie"] = register_cookie
             response = post(register_url, register_headers, data=register_body)
             registration = response_json_or_text(response)
             data = registration.get("data") if isinstance(registration, dict) else None
@@ -929,8 +958,11 @@ def create_guest_account_with_proxy(region, account_name, password_prefix, is_gh
                 try:
                     token_headers = headers(url, content_type)
                     if url == json_url:
-                        # The supplied working client carries the registration signature forward.
+                        # The reference carries the registration signature forward.
                         token_headers["Authorization"] = register_headers["Authorization"]
+                        token_cookie = guest_protocol.oauth_cookie("token")
+                        if token_cookie:
+                            token_headers["Cookie"] = token_cookie
                     response = post(url, token_headers, retry=True, **payload)
                     data = response_json_or_text(response)
                     if isinstance(data, dict) and data.get("code", 0) != 0:
@@ -1002,6 +1034,24 @@ def create_guest_account_with_proxy(region, account_name, password_prefix, is_gh
                 except (ValueError, TypeError):
                     pass
             error_message = f"{stage} failed ({reason})"
+            if isinstance(exc, ReadTimeout):
+                result["error_code"] = "upstream_read_timeout"
+                error_message += ": upstream did not respond within 30 seconds"
+                if stage == "Guest register":
+                    result["registration_outcome_unknown"] = True
+                    error_message += "; registration outcome is unknown, so it was not retried"
+            elif isinstance(exc, ConnectTimeout):
+                result["error_code"] = "upstream_connect_timeout"
+                error_message += ": connection to upstream timed out"
+            elif response is not None and response.status_code == 429:
+                result["error_code"] = "upstream_rate_limited"
+                error_message += ": upstream rate limit reached; wait before trying again"
+                retry_after = response.headers.get("Retry-After")
+                if isinstance(retry_after, str) and retry_after:
+                    result["retry_after"] = retry_after[:100]
+            elif response is not None and response.status_code == 503:
+                result["error_code"] = "upstream_unavailable"
+                error_message += ": upstream service is unavailable"
             if result["guest_created"]:
                 result["warning"] = "Guest created, but " + error_message
             else:
@@ -1277,21 +1327,9 @@ def HeHe(d):
 @FAHHHH.route('/', methods=['GET'])
 def index():
     return jsonify({
-        "status": "ok",
-        "message": "Info API is running.",
-        "endpoints": {
-            "usage": "/usage",
-            "jwt": "/jwt?uid=xxx&pw=xxx",
-            "access_token": "/access-token?uid=xxx&password=xxx",
-            "like": "/like?uid=xxx",
-            "likeff": "/likeff?uid=xxx",
-            "meanffinfo": "/meanffinfo?uid=xxx",
-            "region_check": "/check-region?uid=xxx",
-            "checkbanned": "/checkbanned?id=xxx",
-            "bio": "/bio?token=xxx&bio=hello",
-            "createaccount": "/createaccount?region=ME&name=MEAN",
-            "refresh": "/refresh"
-        }
+        "message": "Welcome to Mean LIKE API!",
+        "owner_telegram": "https://t.me/Mean_Un",
+        "status": "ok"
     }), 200
 
 @FAHHHH.errorhandler(404)

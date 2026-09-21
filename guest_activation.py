@@ -1,4 +1,4 @@
-"""Guest activation using the supplied token / MajorLogin / GetLoginData flow."""
+"""Guest activation using the supplied SIAM OB55 activation service."""
 
 import json
 import time
@@ -66,7 +66,39 @@ def parse_accounts(raw):
     return accounts
 
 
+ACTIVATION_URL = "https://jxe-guest-act-ob55.vercel.app/jxe/act"
+
+
 def activate_guest(uid, password, region="IND"):
+    result = {"success": False, "uid": str(uid)}
+    try:
+        with requests.Session() as session:
+            response = session.get(
+                ACTIVATION_URL, params={"uid": str(uid), "password": password},
+                headers={"User-Agent": "Mozilla/5.0 (Linux; Android 12; Mobile) AppleWebKit/537.36"},
+                timeout=10, allow_redirects=False)
+            if response.status_code != 200:
+                return {**result, "error": f"Activation service returned HTTP {response.status_code}"}
+            data = response.json()
+            if not isinstance(data, dict):
+                return {**result, "error": "Activation service returned an invalid response"}
+            if data.get("status") != "success" and data.get("activated") is not True:
+                return {**result, "error": "Activation service did not confirm activation"}
+            result.update(success=True, activated=True, region=data.get("region") or region)
+            for key in ("account_name", "account_id"):
+                if data.get(key) is not None:
+                    result[key] = data[key]
+            return result
+    except requests.Timeout:
+        return {**result, "error": "Activation service timed out; activation outcome is unknown"}
+    except requests.RequestException:
+        # Request exception strings may contain the credential-bearing URL.
+        return {**result, "error": "Could not connect to activation service"}
+    except ValueError:
+        return {**result, "error": "Activation service returned invalid JSON"}
+
+
+def activate_guest_direct(uid, password, region="IND"):
     for attempt in range(5):
         result = _activate_guest_once(uid, password, region)
         if result.get("success") or not result.get("retryable") or attempt == 4:

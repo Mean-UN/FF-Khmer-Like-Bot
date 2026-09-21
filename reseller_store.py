@@ -39,9 +39,13 @@ class ResellerStore:
                     db.execute("ALTER TABLE sellers RENAME COLUMN daily_limit TO granted_requests")
                 db.execute("CREATE TABLE IF NOT EXISTS seller_grants (grant_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, requests INTEGER NOT NULL, created_at TEXT NOT NULL)")
                 db.execute("CREATE TABLE IF NOT EXISTS seller_events (event_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, name TEXT NOT NULL, day TEXT NOT NULL, created_at TEXT NOT NULL, kind TEXT NOT NULL, uid TEXT NOT NULL, package INTEGER NOT NULL, cents INTEGER NOT NULL, state TEXT NOT NULL, likes INTEGER NOT NULL DEFAULT 0, detail TEXT NOT NULL DEFAULT '', order_json TEXT, exported INTEGER NOT NULL DEFAULT 0)")
+                event_columns = {row[1] for row in db.execute("PRAGMA table_info(seller_events)")}
+                if "request_units" not in event_columns:
+                    db.execute("ALTER TABLE seller_events ADD COLUMN request_units INTEGER NOT NULL DEFAULT 1")
                 db.execute("CREATE TABLE IF NOT EXISTS seller_payments (user_id TEXT NOT NULL, day TEXT NOT NULL, cents INTEGER NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(user_id, day))")
                 db.execute("CREATE TABLE IF NOT EXISTS seller_payment_commands (command_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, day TEXT NOT NULL, cents INTEGER NOT NULL)")
                 db.execute("CREATE TABLE IF NOT EXISTS seller_owner_alerts (event_id TEXT PRIMARY KEY, sent_at TEXT NOT NULL DEFAULT '')")
+                db.execute("CREATE TABLE IF NOT EXISTS seller_alert_receipts (event_id TEXT NOT NULL, chat_id TEXT NOT NULL, PRIMARY KEY(event_id,chat_id))")
                 db.execute("CREATE TABLE IF NOT EXISTS seller_billing_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
                 db.execute("CREATE TABLE IF NOT EXISTS seller_daily_bills (bill_id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, day TEXT NOT NULL, total_cents INTEGER NOT NULL, payload TEXT NOT NULL, status TEXT NOT NULL, chat_id INTEGER, message_id INTEGER, UNIQUE(user_id, day, total_cents))")
                 db.execute("CREATE TABLE IF NOT EXISTS seller_bill_messages (bill_id INTEGER NOT NULL, chat_id INTEGER NOT NULL, message_id INTEGER NOT NULL, PRIMARY KEY (bill_id,chat_id,message_id))")
@@ -100,7 +104,7 @@ class ResellerStore:
             seller = db.execute("SELECT * FROM sellers WHERE user_id=?", (str(user_id),)).fetchone()
             if not seller or not seller["active"]:
                 raise SellerError("Reseller access is disabled")
-            used = db.execute("SELECT COUNT(*) FROM seller_events WHERE user_id=? AND state IN ('pending', 'charged')", (str(user_id),)).fetchone()[0]
+            used = db.execute("SELECT COALESCE(SUM(request_units),0) FROM seller_events WHERE user_id=? AND state IN ('pending', 'charged')", (str(user_id),)).fetchone()[0]
             if used >= seller["granted_requests"]:
                 raise SellerError("No reseller requests available. Ask the owner to add requests. There is no automatic reset.")
             state = "pending" if kind == "likeff" else "charged"
@@ -132,15 +136,35 @@ class ResellerStore:
         with self.db() as db:
             db.execute("UPDATE seller_owner_alerts SET sent_at=? WHERE event_id=?", (self.now().isoformat(), event_id))
 
+    def alert_report(self, event):
+        reports = self.report(event['user_id'], event['day'])
+        if reports:
+            return reports[0]
+        # Historical purchases survive removal of the current seller profile.
+        with self.db() as db:
+            cents = db.execute(
+                "SELECT COALESCE(SUM(cents),0) FROM seller_events WHERE user_id=? AND day=? AND state='charged'",
+                (event['user_id'], event['day'])).fetchone()[0]
+        return {'remaining': 'N/A (seller record missing)', 'cents': cents}
+
+    def alert_delivered(self, event_id, chat_id):
+        with self.db() as db:
+            return db.execute("SELECT 1 FROM seller_alert_receipts WHERE event_id=? AND chat_id=?",
+                              (event_id, str(chat_id))).fetchone() is not None
+
+    def record_alert_delivery(self, event_id, chat_id):
+        with self.db() as db:
+            db.execute("INSERT OR IGNORE INTO seller_alert_receipts VALUES (?,?)", (event_id, str(chat_id)))
+
     def record_order(self, order):
         key = order.get("seller_event_id")
         if key:
             with self.db() as db:
                 sent = int(order.get("sent_likes", 0))
                 detail = order.get("last_error") or order.get("status", "active")
-                db.execute("UPDATE seller_events SET likes=MAX(likes, MIN(package, ?)), detail=? WHERE event_id=?", (sent, detail, key))
+                db.execute("UPDATE seller_events SET likes=MAX(likes, MIN(package, ?)), detail=? WHERE event_id=?", (sent + int(order.get("seller_initial_likes", 0)), detail, key))
                 for extension in order.get("seller_extensions", []):
-                    delivered = max(0, sent - extension["offset"])
+                    delivered = max(0, sent - extension["offset"]) + int(extension.get("initial_likes", 0))
                     db.execute("UPDATE seller_events SET likes=MAX(likes, MIN(package, ?)), detail=? WHERE event_id=?", (delivered, detail, extension["event_id"]))
 
     def history(self, user_id=None, day=None, page=1, size=20):
@@ -174,9 +198,9 @@ class ResellerStore:
                 events = [dict(row) for row in db.execute("SELECT * FROM seller_events WHERE user_id=? AND day=?", (seller["user_id"], day))]
                 charged = [e for e in events if e["state"] == "charged"]
                 paid = db.execute("SELECT cents FROM seller_payments WHERE user_id=? AND day=?", (seller["user_id"], day)).fetchone()
-                consumed = db.execute("SELECT COUNT(*) FROM seller_events WHERE user_id=? AND state='charged'", (seller["user_id"],)).fetchone()[0]
-                pending = db.execute("SELECT COUNT(*) FROM seller_events WHERE user_id=? AND state='pending'", (seller["user_id"],)).fetchone()[0]
-                reports.append({**dict(seller), "day": day, "events": events, "used": len(charged), "pending": pending,
+                consumed = db.execute("SELECT COALESCE(SUM(request_units),0) FROM seller_events WHERE user_id=? AND state='charged'", (seller["user_id"],)).fetchone()[0]
+                pending = db.execute("SELECT COALESCE(SUM(request_units),0) FROM seller_events WHERE user_id=? AND state='pending'", (seller["user_id"],)).fetchone()[0]
+                reports.append({**dict(seller), "day": day, "events": events, "used": sum(e["request_units"] for e in charged), "pending": pending,
                                 "consumed": consumed, "remaining": max(0, seller["granted_requests"] - consumed - pending),
                                 "cents": sum(e["cents"] for e in charged), "paid": paid[0] if paid else 0})
         return reports
