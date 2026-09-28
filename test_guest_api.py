@@ -108,15 +108,26 @@ class GuestApiTests(unittest.TestCase):
         self.assertTrue(response.json['success'])
         self.assertEqual(str(response.json['account_id']), '456')
         registration, token_grant = session.post.call_args_list[:2]
-        self.assertEqual(token_grant.kwargs['headers']['Authorization'],
-                         registration.kwargs['headers']['Authorization'])
+        self.assertNotIn('Authorization', token_grant.kwargs['headers'])
+        self.assertEqual(registration.args[0],
+                         'https://ffmconnect.ppmainecoonghj.com/api/v2/oauth/guest:register')
+        self.assertEqual(token_grant.args[0],
+                         'https://ffmconnect.ppmainecoonghj.com/api/v2/oauth/guest/token:grant')
         body = token_grant.kwargs['data']
         self.assertEqual(body, json.dumps(json.loads(body), separators=(',', ':')).encode())
-        self.assertEqual(json.loads(body)['uid'], '123')
+        self.assertEqual(json.loads(body)['uid'], 123)
         for call in session.post.call_args_list:
             headers = call.kwargs['headers']
             self.assertNotIn('X-Forwarded-For', headers)
             self.assertEqual(headers['Host'], lssj.urlparse(call.args[0]).netloc)
+
+    def test_login_with_64_byte_prefix_preserves_account_and_region(self):
+        raw = MajorLoginRes_pb2.MajorLoginRes(
+            account_id=456, token='test-token', lock_region='SG').SerializeToString()
+        response, _ = self.run_flow(b'\xff' * 64 + raw)
+        self.assertTrue(response.json['success'])
+        self.assertEqual(str(response.json['account_id']), '456')
+        self.assertEqual(response.json['region'], 'SG')
 
     def test_malformed_login_retains_credentials_without_false_success(self):
         response, session = self.run_flow(b'\xffinvalid')

@@ -19,8 +19,9 @@ def oauth_cookie(stage):
 
 REGION_LANG = {"ME":"ar","IND":"hi","ID":"id","VN":"vi","TH":"th","BD":"bn","PK":"ur","TW":"zh","CIS":"ru","SAC":"es","BR":"pt"}
 
-CREATION_HOST = "loginbp.ppmainecoonghj.com"
+CREATION_HOST = "loginbp.ggblueshark.com"
 REGION_HOSTS = dict.fromkeys((*REGION_LANG, "SG", "EU", "US", "LK", "GHOST"), CREATION_HOST)
+REGION_HOSTS.update({"ME": "loginbp.common.ggbluefox.com", "TH": "loginbp.common.ggbluefox.com"})
 
 USER_AGENTS = [
     "UnityPlayer/2022.3.47f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)",
@@ -108,11 +109,11 @@ def region_host(region, is_ghost=False):
 
 
 def creation_login_fields(region, open_id, access_token, is_ghost=False):
-    """SIAM reference login fields, rebuilt with proper protobuf lengths."""
+    """STAR reference login fields, rebuilt with proper protobuf lengths."""
     fields = {3: b'2025-08-30 05:19:21',
      4: b'free fire',
      5: 1,
-     7: b'1.114.13',
+     7: b'2.127.13',
      8: b'Android OS 9 / API-28 (PI/rel.cjw.20220518.114133)',
      9: b'Handheld',
      10: b'ATM Mobils',
@@ -152,7 +153,7 @@ def creation_login_fields(region, open_id, access_token, is_ghost=False):
      78: 3,
      79: 1,
      81: b'32',
-     83: b'2019118693',
+     83: b'2019118692',
      86: b'OpenGLES2',
      87: 16383,
      88: 4,
@@ -166,6 +167,8 @@ def creation_login_fields(region, open_id, access_token, is_ghost=False):
      99: b'4',
      100: b'4',
      102: b'GQ@O\x00\x0e^\x00D\x06UA\x0ePM\r\x13hZ\x07T\x06\x0cm\\V\x0ejYV;\x0bU5'}
+    fields[3] = time.strftime("%Y-%m-%d %H:%M:%S")
+    fields[19] = random_user_id()
     fields[21] = "pt" if is_ghost else REGION_LANG.get(region.upper(), "en")
     fields[22] = open_id
     fields[29] = access_token

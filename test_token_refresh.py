@@ -317,22 +317,21 @@ class GuestGenerationTests(unittest.TestCase):
         self.ns["generate_custom_password"].assert_called_once_with("prefix")
         self.ns["generate_random_name"].assert_called_once_with("base")
         fields = self.ns["build_proto"].call_args_list[0].args[0]
-        self.assertEqual((fields[1], fields[15], fields[16], fields[17]), ("original-name", "pt", 1, 1))
+        self.assertEqual((fields[1], fields[15], fields[16], fields[20], fields[21]), ("original-name", "pt", 2, "2.127.16", 1))
+        self.assertNotIn(17, fields)
         self.session.proxies.update.assert_called_once()
         login_fields = self.ns["build_proto"].call_args_list[1].args[0]
-        self.assertEqual((login_fields[7], login_fields[22], login_fields[21], login_fields[29]), (b"1.114.13", "open", "pt", "access"))
-        self.assertNotIn(20, fields)
-        self.assertNotIn(21, fields)
+        self.assertEqual((login_fields[7], login_fields[22], login_fields[21], login_fields[29]), (b"2.127.13", "open", "pt", "access"))
         for call in self.session.post.call_args_list[2:]:
             headers = call.kwargs['headers']
             self.assertEqual(headers['Host'], 'example.test')
-            self.assertEqual(headers['X-Unity-Version'], '2018.4.12f1')
+            self.assertEqual(headers['X-Unity-Version'], '2022.3.47f1')
             self.assertEqual(headers['Authorization'], 'Bearer')
             self.assertEqual(headers['X-GA-SV'], '1789535859')
         token_request = self.session.post.call_args_list[1]
         self.assertTrue(token_request.args[0].endswith('/api/v2/oauth/guest/token:grant'))
-        self.assertIn('device_id', json.loads(token_request.kwargs['data']))
-        self.assertEqual(token_request.kwargs['headers']['Authorization'], self.session.post.call_args_list[0].kwargs['headers']['Authorization'])
+        self.assertNotIn('device_id', json.loads(token_request.kwargs['data']))
+        self.assertNotIn('Authorization', token_request.kwargs['headers'])
 
     def test_missing_token_fields_uses_fallback_endpoint(self):
         self.session.post.side_effect = [self.response({"data": {"uid": "7"}}), self.response({}), self.response({"data": {"access_token": "access", "open_id": "open"}}), self.response(), self.response()]
@@ -354,10 +353,11 @@ class GuestGenerationTests(unittest.TestCase):
 
     def test_reference_region_routes(self):
         import guest_protocol
-        self.assertEqual(guest_protocol.region_host("SG"), "loginbp.ppmainecoonghj.com")
-        self.assertEqual(guest_protocol.region_host("ME"), "loginbp.ppmainecoonghj.com")
-        self.assertEqual(guest_protocol.region_host("BR"), "loginbp.ppmainecoonghj.com")
-        self.assertEqual(guest_protocol.region_host("SG", True), "loginbp.ppmainecoonghj.com")
+        self.assertEqual(guest_protocol.region_host("SG"), "loginbp.ggblueshark.com")
+        self.assertEqual(guest_protocol.region_host("ME"), "loginbp.common.ggbluefox.com")
+        self.assertEqual(guest_protocol.region_host("TH"), "loginbp.common.ggbluefox.com")
+        self.assertEqual(guest_protocol.region_host("BR"), "loginbp.ggblueshark.com")
+        self.assertEqual(guest_protocol.region_host("SG", True), "loginbp.ggblueshark.com")
 
     def test_encrypted_login_and_external_id_fallback(self):
         from Crypto.Cipher import AES

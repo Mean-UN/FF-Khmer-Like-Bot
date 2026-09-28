@@ -1,5 +1,24 @@
 # Guest creation reference review
 
+## STAR reference update
+
+Guest creation now uses the supplied STAR reference's ffmconnect OAuth v2 host,
+numeric token-grant UID, and token headers without the registration signature or
+old device_id. MajorRegister uses ggblueshark by default and common.ggbluefox for
+ME/TH, with fields 16=2, 20=2.127.16, and 21=1. Game requests use Unity
+2022.3.47f1; creation login uses version 2.127.13, build 2019118692, a current
+timestamp, and a fresh device identifier. The shared response parser now includes
+offset 64 when checking prefixed protobuf responses.
+
+Existing cookie environment overrides, naming, credential recovery, legacy token
+fallback, and region mismatch reporting are retained. The reference's static
+cookie and ChooseRegion call have not been copied; regional placement still
+requires upstream verification. The existing protobuf module remains compatible
+with the core account/token/region fields and the installed runtime.
+Validation is mocked; no live accounts were created.
+
+The notes below describe the earlier SIAM reference integration and are historical.
+
 Compared guest creation with the supplied SIAM-X-RIXOR reference without executing its installer, compressed code, or network operations.
 
 | Stage | Result |

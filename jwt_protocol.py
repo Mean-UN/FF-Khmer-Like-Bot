@@ -74,7 +74,7 @@ def parse_login_response(data):
         except ValueError:
             pass
     for candidate in candidates:
-        for offset in range(min(64, len(candidate))):
+        for offset in range(min(65, len(candidate))):
             response = MajorLoginRes_pb2.MajorLoginRes()
             try:
                 response.ParseFromString(candidate[offset:])

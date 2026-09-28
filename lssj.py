@@ -891,8 +891,8 @@ def create_guest_account_with_proxy(region, account_name, password_prefix, is_gh
         }
         if game:
             values.update({"ReleaseVersion": "OB55", "X-GA": "v1 1",
-                           "X-Unity-Version": "2018.4.12f1",
-                           "User-Agent": "UnityPlayer/2018.4.12f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)",
+                           "X-Unity-Version": "2022.3.47f1",
+                           "User-Agent": "UnityPlayer/2022.3.47f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)",
                            "Accept-Encoding": "deflate, gzip",
                            "Authorization": "Bearer", "X-GA-SV": str(int(time.time()))})
         else:
@@ -921,7 +921,7 @@ def create_guest_account_with_proxy(region, account_name, password_prefix, is_gh
                     time.sleep(2 ** attempt)
 
         try:
-            register_url = "https://100067.connect.garena.com/api/v2/oauth/guest:register"
+            register_url = "https://ffmconnect.ppmainecoonghj.com/api/v2/oauth/guest:register"
             register_payload = {"app_id": 100067, "client_type": 2, "password": password, "source": 2}
             register_body = json.dumps(register_payload, separators=(',', ':')).encode("utf-8")
             signature = hmac.new(CLIENT_SECRET.encode("utf-8"), register_body, hashlib.sha256).hexdigest()
@@ -940,13 +940,12 @@ def create_guest_account_with_proxy(region, account_name, password_prefix, is_gh
 
             stage = "Token grant"
             form_url = "https://100067.connect.garena.com/oauth/guest/token/grant"
-            json_url = "https://100067.connect.garena.com/api/v2/oauth/guest/token:grant"
+            json_url = "https://ffmconnect.ppmainecoonghj.com/api/v2/oauth/guest/token:grant"
             form = {"uid": uid, "password": password, "response_type": "token",
                     "client_type": "2", "client_secret": CLIENT_SECRET, "client_id": CLIENT_ID}
             token_body = json.dumps({
                 "client_id": 100067, "client_secret": CLIENT_SECRET, "client_type": 2,
-                "device_id": "02-344afb0e-593c-40b7-92f2-171972f74807",
-                "password": password, "response_type": "token", "uid": uid,
+                "password": password, "response_type": "token", "uid": int(uid),
             }, separators=(',', ':')).encode("utf-8")
             attempts = [
                 (json_url, "application/json; charset=utf-8", {"data": token_body}),
@@ -958,8 +957,6 @@ def create_guest_account_with_proxy(region, account_name, password_prefix, is_gh
                 try:
                     token_headers = headers(url, content_type)
                     if url == json_url:
-                        # The reference carries the registration signature forward.
-                        token_headers["Authorization"] = register_headers["Authorization"]
                         token_cookie = guest_protocol.oauth_cookie("token")
                         if token_cookie:
                             token_headers["Cookie"] = token_cookie
@@ -987,7 +984,7 @@ def create_guest_account_with_proxy(region, account_name, password_prefix, is_gh
             lang_code = "pt" if is_ghost else guest_protocol.REGION_LANG.get(region, "en")
             payload = build_proto({1: name, 2: access_token, 3: open_id, 5: 102000007,
                                    6: 4, 7: 1, 13: 1, 14: field, 15: lang_code,
-                                   16: 1, 17: 1})
+                                   16: 2, 20: "2.127.16", 21: 1})
             url = major_register_url(region, is_ghost)
             register_headers = headers(url, "application/x-www-form-urlencoded", game=True)
             register_headers["Authorization"] = "Bearer"
