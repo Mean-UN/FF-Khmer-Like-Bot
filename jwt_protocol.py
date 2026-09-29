@@ -5,7 +5,9 @@ import json
 import re
 import zlib
 from datetime import datetime
+from urllib.parse import urlencode
 
+import requests
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
 from google.protobuf.json_format import MessageToDict
@@ -15,24 +17,60 @@ from proto import MajorLoginReq_pb2, MajorLoginRes_pb2
 CLIENT_VERSION = "1.132.3"
 CLIENT_VERSION_CODE = "2024010012"
 RELEASE_VERSION = "OB55"
-OAUTH_URL = "https://100067.connect.garena.com/oauth/guest/token/grant"
+CLIENT_ID = "100067"
+UNITY_USER_AGENT = "UnityPlayer/2018.4.12f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)"
+OAUTH_USER_AGENT = "GarenaMSDK/5.5.2P3(SM-A515F;Android 12;en-US;IND;)"
+# Build/version headers exactly as sent by the supplied reference login.
+GA_SDK_VERSION = "1789534056"
+PLAY_VERSION = "1.132.1"
+REQUEST_TIMEOUT = 30
+OAUTH_URL = "https://ffmconnect.live.gop.garenanow.com/oauth/guest/token/grant"
+OAUTH_FALLBACK_URLS = ("https://100067.connect.garena.com/oauth/guest/token/grant",)
 INSPECT_URL = "https://100067.connect.garena.com/oauth/token/inspect"
-MAJOR_LOGIN_URL = "https://loginbp.ggblueshark.com/MajorLogin"
+MAJOR_LOGIN_URL = "https://loginbp.ppmainecoonghj.com/MajorLogin"
+MAJOR_LOGIN_FALLBACK_URLS = ("https://loginbp.ggblueshark.com/MajorLogin",)
 PROTO_KEY = b'Yg&tc%DEuh6%Zc^8'
 PROTO_IV = b'6oyZDr22E3ychjM%'
 
 
-def generate_access_token(session, uid, password, client_secret):
-    response = session.post(OAUTH_URL, data={
-        "uid": str(uid), "password": password, "response_type": "token",
-        "client_type": "2", "client_id": "100067", "client_secret": client_secret,
-    }, headers={"User-Agent": "GarenaMSDK/5.5.2P3(SM-A515F;Android 12;en-US;IND;)"}, timeout=30)
-    response.raise_for_status()
-    auth = response.json()
+def oauth_headers(user_agent):
+    return {"User-Agent": user_agent, "Connection": "Keep-Alive",
+            "Accept-Encoding": "gzip", "Content-Type": "application/x-www-form-urlencoded"}
+
+
+def read_oauth_credentials(auth):
+    """Guest grant replies are flat or wrapped in a data object."""
     inner = auth.get("data", auth) if isinstance(auth, dict) else {}
     if not isinstance(inner, dict) or not inner.get("open_id") or not inner.get("access_token"):
-        raise ValueError("Guest authentication did not return access_token/open_id")
-    return auth, str(inner["open_id"]), inner["access_token"]
+        return None
+    return str(inner["open_id"]), inner["access_token"]
+
+
+def generate_access_token(session, uid, password, client_secret):
+    """Reference grant host first, the Garena connect host as a fallback."""
+    attempts = [(OAUTH_URL, urlencode([
+        ("uid", uid), ("password", password), ("response_type", "token"),
+        ("client_type", "2"), ("client_secret", client_secret), ("client_id", CLIENT_ID),
+    ]), oauth_headers(UNITY_USER_AGENT))]
+    attempts += [(url, {
+        "uid": str(uid), "password": password, "response_type": "token",
+        "client_type": "2", "client_id": CLIENT_ID, "client_secret": client_secret,
+    }, oauth_headers(OAUTH_USER_AGENT)) for url in OAUTH_FALLBACK_URLS]
+    failures = []
+    for url, body, headers in attempts:
+        try:
+            response = session.post(url, data=body, headers=headers, timeout=REQUEST_TIMEOUT)
+            response.raise_for_status()
+            auth = response.json()
+        except (requests.RequestException, ValueError) as exc:
+            failures.append(f"{url}: {exc}")
+            continue
+        credentials = read_oauth_credentials(auth)
+        if credentials:
+            return auth, credentials[0], credentials[1]
+        failures.append(f"{url}: response had no access_token/open_id")
+    raise ValueError("Guest authentication did not return access_token/open_id ("
+                     + "; ".join(failures) + ")")
 
 
 def inspect_token(session, token):
@@ -120,18 +158,56 @@ def parse_login_response(data):
     raise ValueError("MajorLogin did not return a JWT token")
 
 
-def major_login(session, open_id, access_token):
-    payload = build_major_login_request(open_id, access_token).SerializeToString()
-    encrypted = AES.new(PROTO_KEY, AES.MODE_CBC, PROTO_IV).encrypt(pad(payload, AES.block_size))
-    response = session.post(MAJOR_LOGIN_URL, data=encrypted, headers={
-        "User-Agent": "UnityPlayer/2018.4.12f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)",
-        "Accept": "*/*", "Accept-Encoding": "deflate, gzip",
+def login_headers():
+    """Header set sent by the supplied reference login."""
+    return {
+        "User-Agent": UNITY_USER_AGENT, "Accept": "*/*", "Accept-Encoding": "deflate, gzip",
+        "X-Ga-Sv": GA_SDK_VERSION, "Authorization": "Bearer", "X-GA": "v1 1",
+        "ReleaseVersion": RELEASE_VERSION, "Content-Type": "application/x-www-form-urlencoded",
+        "X-Unity-Version": "2018.4.12f1", "PlAy_VeR": PLAY_VERSION, "Ob_VeR": RELEASE_VERSION,
+    }
+
+
+def fingerprint_login_headers():
+    """Older header set kept for the fallback host."""
+    return {
+        "User-Agent": UNITY_USER_AGENT, "Accept": "*/*", "Accept-Encoding": "deflate, gzip",
         "X-Ga-Sv": str(int(datetime.now().timestamp())), "Authorization": "Bearer",
         "X-GA": "v1 1", "ReleaseVersion": RELEASE_VERSION,
         "Content-Type": "application/x-www-form-urlencoded", "X-Unity-Version": "2018.4.12f1",
-    }, timeout=30)
-    response.raise_for_status()
-    return parse_login_response(response.content)
+    }
+
+
+def encrypt_login_request(request):
+    payload = request.SerializeToString()
+    return AES.new(PROTO_KEY, AES.MODE_CBC, PROTO_IV).encrypt(pad(payload, AES.block_size))
+
+
+def build_login_request(open_id, access_token):
+    """The reference login sends only these four fields, no device fingerprint."""
+    request = MajorLoginReq_pb2.MajorLogin()
+    request.open_id = open_id
+    request.open_id_type = "4"
+    request.access_token = access_token
+    request.origin_platform_type = "4"
+    return request
+
+
+def major_login(session, open_id, access_token):
+    """Reference host with the minimal request; the fingerprint host is a fallback."""
+    attempts = [(MAJOR_LOGIN_URL, build_login_request(open_id, access_token), login_headers())]
+    attempts += [(url, build_major_login_request(open_id, access_token), fingerprint_login_headers())
+                 for url in MAJOR_LOGIN_FALLBACK_URLS]
+    failures = []
+    for url, request, headers in attempts:
+        try:
+            response = session.post(url, data=encrypt_login_request(request), headers=headers,
+                                    timeout=REQUEST_TIMEOUT)
+            response.raise_for_status()
+            return parse_login_response(response.content)
+        except (requests.RequestException, ValueError) as exc:
+            failures.append(f"{url}: {exc}")
+    raise ValueError("MajorLogin did not return a JWT token (" + "; ".join(failures) + ")")
 
 
 def _build_major_login_template():

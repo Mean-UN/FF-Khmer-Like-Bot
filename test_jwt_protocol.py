@@ -35,11 +35,59 @@ class JwtProtocolTests(unittest.TestCase):
         session.post.return_value.content = MajorLoginRes_pb2.MajorLoginRes(token='test-token').SerializeToString()
         protocol.major_login(session, 'open', 'access')
         call = session.post.call_args
+        self.assertEqual(session.post.call_count, 1)
         self.assertEqual(call.args[0], protocol.MAJOR_LOGIN_URL)
+        self.assertEqual(call.args[0], 'https://loginbp.ppmainecoonghj.com/MajorLogin')
         self.assertNotIn('Host', call.kwargs['headers'])
         plain = unpad(AES.new(protocol.PROTO_KEY, AES.MODE_CBC, protocol.PROTO_IV).decrypt(call.kwargs['data']), 16)
         parsed = type(req)(); parsed.ParseFromString(plain)
         self.assertEqual(parsed.access_token, 'access')
+
+    def test_reference_login_sends_only_credential_fields(self):
+        req = protocol.build_login_request('open', 'access')
+        self.assertEqual([field.name for field, _ in req.ListFields()],
+                         ['open_id', 'open_id_type', 'access_token', 'origin_platform_type'])
+        self.assertEqual((req.open_id, req.open_id_type, req.access_token, req.origin_platform_type),
+                         ('open', '4', 'access', '4'))
+        session = Mock()
+        session.post.return_value.content = MajorLoginRes_pb2.MajorLoginRes(token='test-token').SerializeToString()
+        protocol.major_login(session, 'open', 'access')
+        call = session.post.call_args
+        headers = call.kwargs['headers']
+        self.assertEqual(headers['PlAy_VeR'], '1.132.1')
+        self.assertEqual(headers['Ob_VeR'], protocol.RELEASE_VERSION)
+        self.assertEqual(headers['ReleaseVersion'], protocol.RELEASE_VERSION)
+        self.assertEqual(headers['X-Ga-Sv'], '1789534056')
+        self.assertEqual(headers['Authorization'], 'Bearer')
+        self.assertEqual(headers['X-Unity-Version'], '2018.4.12f1')
+        plain = unpad(AES.new(protocol.PROTO_KEY, AES.MODE_CBC, protocol.PROTO_IV).decrypt(call.kwargs['data']), 16)
+        parsed = protocol.MajorLoginReq_pb2.MajorLogin(); parsed.ParseFromString(plain)
+        self.assertEqual([field.name for field, _ in parsed.ListFields()],
+                         ['open_id', 'open_id_type', 'access_token', 'origin_platform_type'])
+        self.assertEqual(plain, protocol.build_login_request('open', 'access').SerializeToString())
+
+    def test_login_falls_back_to_fingerprint_host(self):
+        import requests
+        token = MajorLoginRes_pb2.MajorLoginRes(token='test-token').SerializeToString()
+        session = Mock()
+        failure = Mock(); failure.raise_for_status.side_effect = requests.HTTPError('boom')
+        session.post.side_effect = [failure, Mock(content=token)]
+        self.assertEqual(protocol.major_login(session, 'open', 'access')['token'], 'test-token')
+        self.assertEqual([call.args[0] for call in session.post.call_args_list],
+                         [protocol.MAJOR_LOGIN_URL, *protocol.MAJOR_LOGIN_FALLBACK_URLS])
+        fallback = session.post.call_args_list[1]
+        plain = unpad(AES.new(protocol.PROTO_KEY, AES.MODE_CBC, protocol.PROTO_IV).decrypt(fallback.kwargs['data']), 16)
+        parsed = protocol.MajorLoginReq_pb2.MajorLogin(); parsed.ParseFromString(plain)
+        self.assertEqual(parsed.client_version_code, protocol.CLIENT_VERSION_CODE)
+        self.assertEqual(parsed.access_token, 'access')
+
+    def test_login_reports_both_hosts_when_no_token(self):
+        session = Mock()
+        session.post.return_value.content = b'BR_LOGIN_VERSION_NOT_ALLOW'
+        with self.assertRaises(ValueError) as caught:
+            protocol.major_login(session, 'open', 'access')
+        for url in (protocol.MAJOR_LOGIN_URL, *protocol.MAJOR_LOGIN_FALLBACK_URLS):
+            self.assertIn(url, str(caught.exception))
 
     def test_response_encodings_preserve_api_fields(self):
         raw = MajorLoginRes_pb2.MajorLoginRes(account_id=123, lock_region='SG', token='test-token', server_url='https://example.test').SerializeToString()
@@ -69,6 +117,34 @@ class JwtProtocolTests(unittest.TestCase):
             session=Mock(); session.post.return_value.json.return_value=auth
             self.assertEqual(protocol.generate_access_token(session, '123', 'pw', 'secret')[1:], ('open','access'))
             self.assertIn('data', session.post.call_args.kwargs)
+
+    def test_oauth_uses_reference_host_body_and_headers(self):
+        session=Mock(); session.post.return_value.json.return_value={'open_id':'open','access_token':'access'}
+        protocol.generate_access_token(session, '123', 'pw', 'secret')
+        self.assertEqual(session.post.call_count, 1)
+        call = session.post.call_args
+        self.assertEqual(call.args[0], 'https://ffmconnect.live.gop.garenanow.com/oauth/guest/token/grant')
+        self.assertEqual(call.kwargs['data'],
+                         'uid=123&password=pw&response_type=token&client_type=2&client_secret=secret&client_id=100067')
+        self.assertEqual(call.kwargs['headers']['User-Agent'], protocol.UNITY_USER_AGENT)
+
+    def test_oauth_falls_back_to_garena_host(self):
+        import requests
+        session=Mock()
+        failure=Mock(); failure.raise_for_status.side_effect=requests.HTTPError('boom')
+        session.post.side_effect=[failure, Mock(json=Mock(return_value={'open_id':'open','access_token':'access'}))]
+        self.assertEqual(protocol.generate_access_token(session, '123', 'pw', 'secret')[1:], ('open','access'))
+        self.assertEqual([call.args[0] for call in session.post.call_args_list],
+                         [protocol.OAUTH_URL, *protocol.OAUTH_FALLBACK_URLS])
+        self.assertEqual(session.post.call_args_list[1].kwargs['data']['uid'], '123')
+
+    def test_oauth_failure_names_both_hosts(self):
+        session=Mock(); session.post.return_value.json.return_value={'error':'invalid'}
+        with self.assertRaises(ValueError) as caught:
+            protocol.generate_access_token(session, '123', 'pw', 'secret')
+        self.assertEqual(session.post.call_count, 2)
+        for url in (protocol.OAUTH_URL, *protocol.OAUTH_FALLBACK_URLS):
+            self.assertIn(url, str(caught.exception))
 
 class JwtRouteTests(unittest.TestCase):
     def test_routes_and_refresh(self):
