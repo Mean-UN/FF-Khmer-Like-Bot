@@ -27,3 +27,11 @@ class JwtRateLimit:
                 return 0
         finally:
             db.close()
+
+    def wait(self):
+        """Wait for a reservation without holding a database lock."""
+        while True:
+            retry_after = self.reserve()
+            if not retry_after:
+                return
+            time.sleep(min(retry_after, 1))

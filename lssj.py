@@ -58,6 +58,8 @@ load_api_env()
 
 jwt_rate_limit = JwtRateLimit(os.environ.get(
     "JWT_RATE_LIMIT_DB", os.path.join(os.path.dirname(os.path.abspath(__file__)), "jwt_rate_limit.sqlite3")))
+token_refresh_rate_limit = JwtRateLimit(os.environ.get(
+    "TOKEN_REFRESH_RATE_LIMIT_DB", os.path.join(os.path.dirname(os.path.abspath(__file__)), "token_refresh_rate_limit.sqlite3")))
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -773,6 +775,7 @@ def validate_like_jwt(session, token, account_id, region):
 
 
 def fetch_guest_jwt_for_like(uid, password, session=None):
+    token_refresh_rate_limit.wait()
     session = session if session is not None else http_session
     _, open_id, access_token = jwt_protocol.generate_access_token(session, uid, password, CLIENT_SECRET)
     major_login = jwt_protocol.major_login(session, open_id, access_token)

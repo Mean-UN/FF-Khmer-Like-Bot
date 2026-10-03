@@ -1,5 +1,19 @@
 # Token refresh
 
+All calls to `fetch_guest_jwt_for_like` share a quota of 100 refresh attempts
+in any rolling 60-second window. Every retry consumes another reservation.
+When full, workers wait before authentication; waiting does not count as failure.
+This covers Like and LikeFF slots, manual updates and bot account additions.
+The limit is a maximum attempt rate, not a promise of 100 successful tokens.
+
+The quota is stored in `token_refresh_rate_limit.sqlite3` beside `lssj.py`,
+separately from the `/jwt` endpoint quota. Workers and standalone updaters
+using the same file share the limit, including across restarts. Override the
+path with `TOKEN_REFRESH_RATE_LIMIT_DB` for persistent local storage.
+Separate hosts have separate quotas. Existing subprocess timeouts still apply;
+large batches and repeated failures can take longer while waiting for capacity.
+Deploy `jwt_rate_limit.py` with `lssj.py` and restart the API and bots.
+
 The seven-hour automatic cycle refreshes three token sets/slots concurrently.
 Each updater refreshes four accounts concurrently, with its own HTTP session
 per account and up to three attempts, waiting two and then four seconds

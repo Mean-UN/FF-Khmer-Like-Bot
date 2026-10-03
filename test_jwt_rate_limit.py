@@ -8,6 +8,24 @@ from jwt_rate_limit import JwtRateLimit
 
 
 class JwtRateLimitTests(unittest.TestCase):
+    def test_wait_rechecks_quota_without_long_sleeps(self):
+        limiter = JwtRateLimit('unused')
+        with patch.object(limiter, 'reserve', side_effect=[60, 1, 0]) as reserve, patch('jwt_rate_limit.time.sleep') as sleep:
+            limiter.wait()
+            self.assertEqual(reserve.call_count, 3)
+            self.assertEqual([call.args for call in sleep.call_args_list], [(1,), (1,)])
+
+    def test_refresh_reserves_before_authentication_and_on_retry(self):
+        import lssj
+        events = []
+        def authenticate(*args):
+            events.append('auth')
+            raise ValueError('mock login failure')
+        with patch.object(lssj.token_refresh_rate_limit, 'wait', side_effect=lambda: events.append('reserve')), patch.object(lssj.jwt_protocol, 'generate_access_token', side_effect=authenticate), patch.object(lssj.time, 'sleep'):
+            with self.assertRaises(ValueError):
+                lssj.fetch_guest_jwt_for_like_with_retry('123', 'fake', max_retries=2)
+        self.assertEqual(events, ['reserve', 'auth', 'reserve', 'auth'])
+
     def test_sliding_window_and_restart(self):
         with tempfile.TemporaryDirectory() as folder:
             path = str(Path(folder) / 'quota.sqlite3')
