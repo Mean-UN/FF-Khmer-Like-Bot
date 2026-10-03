@@ -1,0 +1,43 @@
+import tempfile
+import unittest
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from unittest.mock import patch
+
+from jwt_rate_limit import JwtRateLimit
+
+
+class JwtRateLimitTests(unittest.TestCase):
+    def test_sliding_window_and_restart(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = str(Path(folder) / 'quota.sqlite3')
+            limiter = JwtRateLimit(path)
+            with patch('jwt_rate_limit.time.time', return_value=1000):
+                self.assertEqual([limiter.reserve() for _ in range(100)], [0] * 100)
+                self.assertEqual(JwtRateLimit(path).reserve(), 60)
+            with patch('jwt_rate_limit.time.time', return_value=1059.1):
+                self.assertEqual(limiter.reserve(), 1)
+            with patch('jwt_rate_limit.time.time', return_value=1060):
+                self.assertEqual(limiter.reserve(), 0)
+
+    def test_concurrent_workers_share_quota(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = str(Path(folder) / 'quota.sqlite3')
+            with patch('jwt_rate_limit.time.time', return_value=1000):
+                with ThreadPoolExecutor(max_workers=8) as pool:
+                    results = list(pool.map(lambda _: JwtRateLimit(path).reserve(), range(120)))
+            self.assertEqual(results.count(0), 100)
+            self.assertEqual(results.count(60), 20)
+
+    def test_route_rejects_before_authentication(self):
+        import lssj
+        client = lssj.app.test_client()
+        with patch.object(lssj.jwt_rate_limit, 'reserve', return_value=12), patch.object(lssj.jwt_protocol, 'generate_access_token') as auth, patch.object(lssj.jwt_protocol, 'inspect_token') as inspect:
+            for response in (client.get('/jwt?uid=123&pw=pw'),
+                             client.post('/jwt', json={'access_token': 'access'})):
+                self.assertEqual(response.status_code, 429)
+                self.assertEqual(response.headers['Retry-After'], '12')
+                self.assertEqual(response.json['retry_after'], 12)
+            self.assertEqual(client.get('/jwt').status_code, 400)
+            auth.assert_not_called()
+            inspect.assert_not_called()

@@ -16,6 +16,9 @@ from request_usage import ICT, SlotUsage
 
 class SlotIntegrationTests(unittest.TestCase):
     def setUp(self):
+        key_patch = patch.dict(os.environ, {'LIKE_API_KEY': 'integration-secret'})
+        key_patch.start()
+        self.addCleanup(key_patch.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.tracker = SlotUsage(os.path.join(self.temp.name, "usage.db"))
@@ -58,7 +61,7 @@ class SlotIntegrationTests(unittest.TestCase):
 
     def api(self, endpoint, params, **kwargs):
         with lssj.app.test_client() as client:
-            return client.get("/" + endpoint, query_string=params).json
+            return client.get("/" + endpoint, query_string=params, headers={'X-API-Key': 'integration-secret'}).json
 
     def manual(self):
         message = SimpleNamespace(from_user=SimpleNamespace(id=7))

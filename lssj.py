@@ -8,6 +8,7 @@ import hashlib
 import hmac
 import guest_protocol
 import jwt_protocol
+from jwt_rate_limit import JwtRateLimit
 from Crypto.Util.Padding import unpad
 import threading
 import base64
@@ -54,6 +55,9 @@ def load_api_env():
 
 
 load_api_env()
+
+jwt_rate_limit = JwtRateLimit(os.environ.get(
+    "JWT_RATE_LIMIT_DB", os.path.join(os.path.dirname(os.path.abspath(__file__)), "jwt_rate_limit.sqlite3")))
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -1364,6 +1368,14 @@ def jwt_login():
         return jsonify({"status": "error", "message": "Provide uid and pw, or access_token"}), 400
     if not access_token and not str(uid).isdigit():
         return jsonify({"status": "error", "message": "uid must be a number"}), 400
+    retry_after = jwt_rate_limit.reserve()
+    if retry_after:
+        response = jsonify({"status": "error", "code": "JWT_RATE_LIMIT_EXCEEDED",
+                            "message": "JWT generation limit reached: 100 requests per minute",
+                            "retry_after": retry_after})
+        response.status_code = 429
+        response.headers['Retry-After'] = str(retry_after)
+        return response
     response_payload = {"creator": "MEAN²", "status": "success", "Guest_Auth": None, "MajorLogin": None}
     try:
         if access_token:
@@ -1420,6 +1432,14 @@ def access_token_api():
     return jsonify(result), status
 
 def run_like_api(token_file, endpoint_name, auto_slot=False):
+    expected_key = os.environ.get("LIKE_API_KEY", "").strip()
+    if not expected_key:
+        return jsonify({"success": False, "code": "LIKE_API_KEY_NOT_CONFIGURED",
+                        "error": "Like API authentication is not configured"}), 503
+    supplied_key = request.headers.get("X-API-Key", "")
+    if not hmac.compare_digest(supplied_key.encode("utf-8"), expected_key.encode("utf-8")):
+        return jsonify({"success": False, "code": "LIKE_API_UNAUTHORIZED",
+                        "error": "Invalid or missing API key"}), 401
     uid = request.args.get("uid")
     requested_region = request.args.get("region") or request.args.get("server_name")
 

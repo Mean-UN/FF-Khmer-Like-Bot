@@ -43,7 +43,7 @@ def load_local_env(path=".env"):
             os.environ.setdefault(key, value)
 
 
-load_local_env()
+load_local_env(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 LIKE_BOT_TOKEN = os.getenv("LIKE_BOT_TOKEN", "").strip()
@@ -433,8 +433,15 @@ def acquire_bot_instance_lock():
 
 def call_api(endpoint, params, timeout=120):
     url = f"{API_BASE_URL}/{endpoint.lstrip('/')}"
+    request_options = {}
+    if endpoint.lstrip('/') in ('like', 'likeff'):
+        key = os.environ.get('LIKE_API_KEY', '').strip()
+        if not key:
+            return {"success": False, "code": "LIKE_API_KEY_NOT_CONFIGURED",
+                    "error": "LIKE_API_KEY is not configured for the bot"}
+        request_options = {'headers': {'X-API-Key': key}, 'allow_redirects': False}
     try:
-        response = requests.get(url, params=params, timeout=timeout)
+        response = requests.get(url, params=params, timeout=timeout, **request_options)
     except requests.Timeout:
         return {"success": False, "error": f"API timeout after {timeout} seconds"}
     except requests.RequestException as exc:

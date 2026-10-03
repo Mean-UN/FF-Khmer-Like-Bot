@@ -1,10 +1,15 @@
 import unittest
+import os
 from unittest.mock import patch, AsyncMock
 import lssj
 
 class RegionSelectionTests(unittest.TestCase):
     def setUp(self):
+        key_patch = patch.dict(os.environ, {'LIKE_API_KEY': 'region-test-secret'})
+        key_patch.start()
+        self.addCleanup(key_patch.stop)
         self.client = lssj.app.test_client()
+        self.client.environ_base['HTTP_X_API_KEY'] = 'region-test-secret'
 
     def test_explicit_region_skips_lookup_and_cache(self):
         with patch.object(lssj,'get_cached_region') as cache, patch.object(lssj,'fetch_player_personal_show') as lookup, patch.object(lssj,'load_like_tokens',return_value=[]):
@@ -42,12 +47,18 @@ class RegionalLoginTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SharedProfileLookupTests(unittest.TestCase):
+    def setUp(self):
+        key_patch = patch.dict(os.environ, {'LIKE_API_KEY': 'region-test-secret'})
+        key_patch.start()
+        self.addCleanup(key_patch.stop)
+
     def test_ffinfo_saves_region_and_uid_only_like_reuses_it(self):
         import tempfile
         from pathlib import Path
         uid = '16306497171'
         with tempfile.TemporaryDirectory() as folder, patch.object(lssj, 'REGION_CACHE_FILE', str(Path(folder) / 'regions.json')), patch.dict(lssj.UID_MEMORY, clear=True), patch.object(lssj, 'LoL', new_callable=AsyncMock, return_value={'basicInfo': {'accountId': uid, 'region': 'SG'}}) as profile:
             client = lssj.app.test_client()
+            client.environ_base['HTTP_X_API_KEY'] = 'region-test-secret'
             response = client.get('/meanffinfo?uid=' + uid)
             self.assertEqual(response.status_code, 200)
             self.assertEqual(lssj.get_cached_region(uid), 'SG')

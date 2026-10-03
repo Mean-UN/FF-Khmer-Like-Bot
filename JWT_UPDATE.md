@@ -28,6 +28,19 @@ The response retains `Guest_Auth` and `MajorLogin`, including `MajorLogin.jwt_to
 
 ## Function compatibility
 
+### JWT endpoint quota
+
+`GET /jwt` and `POST /jwt` share a global quota of 100 valid-input requests
+in any rolling 60-second window. Failed authentication attempts also consume
+quota; missing or invalid inputs do not. Excess requests return HTTP 429,
+`code: JWT_RATE_LIMIT_EXCEEDED`, `retry_after` seconds and a `Retry-After` header.
+No authentication request is sent when the quota is exhausted.
+
+The SQLite quota persists across restarts and is shared by workers using the
+same file. Set `JWT_RATE_LIMIT_DB` to a persistent local path if needed; it defaults
+to `jwt_rate_limit.sqlite3` beside the API. Separate hosts have separate quotas.
+Internal like-token refresh functions are outside this endpoint quota.
+
 | Existing function | Integration |
 | --- | --- |
 | `jwt_login` | Uses the new guest OAuth, token inspection, login request and response parsing. |
