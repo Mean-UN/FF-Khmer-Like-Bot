@@ -40,8 +40,8 @@ class JwtProtocolTests(unittest.TestCase):
         self.assertEqual(call.args[0], 'https://loginbp.ppmainecoonghj.com/MajorLogin')
         self.assertNotIn('Host', call.kwargs['headers'])
         plain = unpad(AES.new(protocol.PROTO_KEY, AES.MODE_CBC, protocol.PROTO_IV).decrypt(call.kwargs['data']), 16)
-        parsed = type(req)(); parsed.ParseFromString(plain)
-        self.assertEqual(parsed.access_token, 'access')
+        self.assertIn(b'\xb2\x01\x04open', plain)
+        self.assertIn(b'\xea\x01\x06access', plain)
 
     def test_reference_login_sends_only_credential_fields(self):
         req = protocol.build_login_request('open', 'access')
@@ -54,32 +54,44 @@ class JwtProtocolTests(unittest.TestCase):
         protocol.major_login(session, 'open', 'access')
         call = session.post.call_args
         headers = call.kwargs['headers']
-        self.assertEqual(headers['PlAy_VeR'], '1.132.1')
-        self.assertEqual(headers['Ob_VeR'], protocol.RELEASE_VERSION)
         self.assertEqual(headers['ReleaseVersion'], protocol.RELEASE_VERSION)
-        self.assertEqual(headers['X-Ga-Sv'], '1789534056')
-        self.assertEqual(headers['Authorization'], 'Bearer')
+        self.assertEqual(headers['X-GA-SV'], '1789535859')
+        self.assertEqual(headers['Authorization'], 'Bearer access')
+        self.assertEqual(headers['Content-Type'], 'application/octet-stream')
         self.assertEqual(headers['X-Unity-Version'], '2018.4.12f1')
         plain = unpad(AES.new(protocol.PROTO_KEY, AES.MODE_CBC, protocol.PROTO_IV).decrypt(call.kwargs['data']), 16)
-        parsed = protocol.MajorLoginReq_pb2.MajorLogin(); parsed.ParseFromString(plain)
-        self.assertEqual([field.name for field, _ in parsed.ListFields()],
-                         ['open_id', 'open_id_type', 'access_token', 'origin_platform_type'])
-        self.assertEqual(plain, protocol.build_login_request('open', 'access').SerializeToString())
+        self.assertIn(b'1.132.9', plain)
+        self.assertIn(b'2019116753', plain)
+        self.assertIn(b'\xca\x01\x0fOnePlus CPH2411', plain)
+        self.assertNotIn('verify', call.kwargs)
 
     def test_login_falls_back_to_fingerprint_host(self):
         import requests
         token = MajorLoginRes_pb2.MajorLoginRes(token='test-token').SerializeToString()
         session = Mock()
         failure = Mock(); failure.raise_for_status.side_effect = requests.HTTPError('boom')
-        session.post.side_effect = [failure, Mock(content=token)]
+        session.post.side_effect = [failure, failure, Mock(content=token)]
         self.assertEqual(protocol.major_login(session, 'open', 'access')['token'], 'test-token')
         self.assertEqual([call.args[0] for call in session.post.call_args_list],
-                         [protocol.MAJOR_LOGIN_URL, *protocol.MAJOR_LOGIN_FALLBACK_URLS])
-        fallback = session.post.call_args_list[1]
+                         [protocol.MAJOR_LOGIN_URL, protocol.MAJOR_LOGIN_URL, *protocol.MAJOR_LOGIN_FALLBACK_URLS])
+        fallback = session.post.call_args_list[2]
         plain = unpad(AES.new(protocol.PROTO_KEY, AES.MODE_CBC, protocol.PROTO_IV).decrypt(fallback.kwargs['data']), 16)
         parsed = protocol.MajorLoginReq_pb2.MajorLogin(); parsed.ParseFromString(plain)
         self.assertEqual(parsed.client_version_code, protocol.CLIENT_VERSION_CODE)
         self.assertEqual(parsed.access_token, 'access')
+
+    def test_new_reference_falls_back_to_previous_minimal_request(self):
+        import requests
+        session = Mock()
+        failure = Mock()
+        failure.raise_for_status.side_effect = requests.HTTPError('reference rejected')
+        token = MajorLoginRes_pb2.MajorLoginRes(token='test-token').SerializeToString()
+        session.post.side_effect = [failure, Mock(content=token)]
+        self.assertEqual(protocol.major_login(session, 'open', 'access')['token'], 'test-token')
+        call = session.post.call_args_list[1]
+        plain = unpad(AES.new(protocol.PROTO_KEY, AES.MODE_CBC, protocol.PROTO_IV).decrypt(call.kwargs['data']), 16)
+        self.assertEqual(plain, protocol.build_login_request('open', 'access').SerializeToString())
+        self.assertNotIn('verify', call.kwargs)
 
     def test_login_reports_both_hosts_when_no_token(self):
         session = Mock()
@@ -147,6 +159,21 @@ class JwtProtocolTests(unittest.TestCase):
             self.assertIn(url, str(caught.exception))
 
 class JwtRouteTests(unittest.TestCase):
+    def test_failure_stage_and_safe_validation_reason(self):
+        import lssj
+        import requests
+        client = lssj.app.test_client()
+        error = requests.HTTPError('secret-token must not be exposed', response=Mock(status_code=401))
+        with patch.object(lssj.jwt_rate_limit, 'reserve', return_value=0), patch.object(protocol, 'inspect_token', return_value={'open_id': 'open'}), patch.object(protocol, 'major_login', return_value={'account_id': '123', 'lock_region': 'SG', 'token': 'secret-token'}), patch.object(lssj, 'validate_like_jwt', side_effect=error):
+            response = client.post('/jwt', json={'access_token': 'secret-access'})
+            self.assertEqual(response.status_code, 502)
+            self.assertEqual(response.json['stage'], 'profile_validation')
+            self.assertEqual(response.json['upstream_status'], 401)
+            self.assertNotIn('secret', response.get_data(as_text=True))
+        with patch.object(lssj.jwt_rate_limit, 'reserve', return_value=0), patch.object(protocol, 'inspect_token', return_value={'open_id': 'open'}), patch.object(protocol, 'major_login', return_value={'token': 'token'}), patch.object(lssj, 'validate_like_jwt', side_effect=ValueError('JWT region missing or unsupported')):
+            response = client.post('/jwt', json={'access_token': 'access'})
+            self.assertEqual(response.json['reason'], 'JWT_REGION_INVALID')
+
     def test_routes_and_refresh(self):
         import lssj
         client=lssj.app.test_client()

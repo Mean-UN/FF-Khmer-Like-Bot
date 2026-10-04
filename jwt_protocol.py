@@ -4,7 +4,8 @@ import gzip
 import json
 import re
 import zlib
-from datetime import datetime
+import uuid
+from datetime import datetime, timezone
 from urllib.parse import urlencode
 
 import requests
@@ -179,7 +180,7 @@ def fingerprint_login_headers():
 
 
 def encrypt_login_request(request):
-    payload = request.SerializeToString()
+    payload = request if isinstance(request, bytes) else request.SerializeToString()
     return AES.new(PROTO_KEY, AES.MODE_CBC, PROTO_IV).encrypt(pad(payload, AES.block_size))
 
 
@@ -193,12 +194,58 @@ def build_login_request(open_id, access_token):
     return request
 
 
+def build_reference_login_request(open_id, access_token):
+    """Encode the supplied MajorLogin wire layout without altering shared schemas."""
+    fields = {
+        3: datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+        4: "free fire", 5: 4, 7: "1.132.9", 8: "2019116753",
+        9: "Android OS 13 / API-33 (TP1A.220624.014)",
+        10: "Handheld", 11: "OnePlus CPH2411", 12: 1280, 13: 720,
+        14: "240", 15: "ARM64 FP ASIMD AES | 2400 | 8", 16: 6000,
+        17: "Adreno (TM) 730", 18: "OpenGL ES 3.1 v1.46",
+        19: f"Google|{uuid.uuid4()}", 20: "0.0.0.0", 21: "en",
+        22: str(open_id), 23: "4", 24: "Handheld", 25: "OnePlus CPH2411",
+        29: str(access_token), 30: 1, 41: "Jio", 42: "WIFI",
+        92: 20000, 93: "android_max", 97: 1, 98: 1,
+        99: "4", 100: "4", 104: 77149, 105: 1,
+    }
+
+    def varint(number):
+        result = bytearray()
+        while number > 127:
+            result.append((number & 127) | 128)
+            number >>= 7
+        result.append(number)
+        return bytes(result)
+
+    payload = bytearray()
+    for number, value in fields.items():
+        if isinstance(value, int):
+            payload.extend(varint(number << 3) + varint(value))
+        else:
+            raw = value.encode('utf-8')
+            payload.extend(varint((number << 3) | 2) + varint(len(raw)) + raw)
+    return bytes(payload)
+
+
+def reference_login_headers(access_token):
+    return {
+        "User-Agent": "GarenaMSDK/4.0.45(25028RN03A ;Android 13;en;app 1.132.9 2019116753;)",
+        "Accept-Encoding": "deflate, gzip", "X-GA-SV": "1789535859",
+        "Authorization": f"Bearer {access_token}", "X-GA": "v1 1",
+        "ReleaseVersion": RELEASE_VERSION, "Content-Type": "application/octet-stream",
+        "X-Unity-Version": "2018.4.12f1",
+    }
+
+
 def major_login(session, open_id, access_token):
-    """Reference host with the minimal request; the fingerprint host is a fallback."""
-    attempts = [(MAJOR_LOGIN_URL, build_login_request(open_id, access_token), login_headers())]
+    """New reference wire layout, then the previously supported login fallbacks."""
+    attempts = [(MAJOR_LOGIN_URL, build_reference_login_request(open_id, access_token), reference_login_headers(access_token)),
+                (MAJOR_LOGIN_URL, build_login_request(open_id, access_token), login_headers())]
     attempts += [(url, build_major_login_request(open_id, access_token), fingerprint_login_headers())
                  for url in MAJOR_LOGIN_FALLBACK_URLS]
     failures = []
+    diagnostics = []
     for url, request, headers in attempts:
         try:
             response = session.post(url, data=encrypt_login_request(request), headers=headers,
@@ -207,7 +254,13 @@ def major_login(session, open_id, access_token):
             return parse_login_response(response.content)
         except (requests.RequestException, ValueError) as exc:
             failures.append(f"{url}: {exc}")
-    raise ValueError("MajorLogin did not return a JWT token (" + "; ".join(failures) + ")")
+            upstream = getattr(exc, 'response', None)
+            diagnostics.append({"attempt": len(diagnostics) + 1,
+                                "error_type": type(exc).__name__,
+                                "http_status": upstream.status_code if upstream is not None else None})
+    error = ValueError("MajorLogin did not return a JWT token (" + "; ".join(failures) + ")")
+    error.login_diagnostics = diagnostics
+    raise error
 
 
 def _build_major_login_template():

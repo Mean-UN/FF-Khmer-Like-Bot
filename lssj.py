@@ -1389,8 +1389,10 @@ def jwt_login():
         response_payload['Guest_Auth'] = convert_timestamps_to_human(auth_data)
     except (requests.RequestException, ValueError):
         return jsonify({"status": "error", "message": "Guest authentication or token inspection failed"}), 401
+    failure_stage = 'major_login'
     try:
         major_dict = dict(jwt_protocol.major_login(http_session, open_id, access_token))
+        failure_stage = 'profile_validation'
         claims = decode_jwt_payload(major_dict.get('token'))
         response_payload['TokenValidation'] = validate_like_jwt(
             http_session, major_dict.get('token'),
@@ -1419,8 +1421,36 @@ def jwt_login():
         response_payload["MajorLogin"] = convert_timestamps_to_human(ordered_major_dict)
         return jsonify(response_payload), 200
 
-    except (requests.RequestException, ValueError):
-        return jsonify({"status": "error", "message": "MajorLogin or JWT profile validation failed"}), 502
+    except (requests.RequestException, ValueError) as exc:
+        upstream = getattr(exc, 'response', None)
+        reason = 'UPSTREAM_REQUEST_FAILED' if isinstance(exc, requests.RequestException) else 'INVALID_LOGIN_RESPONSE'
+        validation_reasons = {
+            'Malformed JWT returned by MajorLogin': 'MALFORMED_JWT',
+            'Malformed JWT header or signature': 'MALFORMED_JWT',
+            'JWT signing algorithm missing or invalid': 'INVALID_JWT_ALGORITHM',
+            'Malformed HS256 signature length': 'INVALID_JWT_SIGNATURE_LENGTH',
+            'Malformed JWT claims': 'MALFORMED_JWT_CLAIMS',
+            'JWT expiry missing, expired or too close to expiry': 'JWT_EXPIRED_OR_MISSING_EXPIRY',
+            'JWT account ID missing': 'JWT_ACCOUNT_ID_MISSING',
+            'JWT account ID does not match login response': 'JWT_ACCOUNT_ID_MISMATCH',
+            'JWT region missing or unsupported': 'JWT_REGION_INVALID',
+            'JWT region does not match login response': 'JWT_REGION_MISMATCH',
+            'JWT profile validation returned invalid protobuf': 'INVALID_PROFILE_RESPONSE',
+            'JWT profile validation did not return the expected account': 'PROFILE_ACCOUNT_MISMATCH',
+        }
+        if failure_stage == 'profile_validation':
+            reason = validation_reasons.get(str(exc), reason)
+        details = {"status": "error", "code": 'JWT_' + failure_stage.upper() + '_FAILED',
+                   "stage": failure_stage, "reason": reason,
+                   "message": "MajorLogin failed" if failure_stage == 'major_login' else "JWT profile validation failed"}
+        if upstream is not None:
+            details['upstream_status'] = upstream.status_code
+        attempts = getattr(exc, 'login_diagnostics', None)
+        if attempts is not None:
+            details['attempts'] = attempts
+        FAHHHH.logger.warning("JWT failure stage=%s reason=%s error_type=%s upstream_status=%s attempts=%s",
+                              failure_stage, reason, type(exc).__name__, details.get('upstream_status'), attempts)
+        return jsonify(details), 502
 
 @FAHHHH.route('/access-token', methods=['GET', 'POST'])
 def access_token_api():

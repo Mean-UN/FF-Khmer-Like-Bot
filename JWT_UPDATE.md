@@ -1,5 +1,29 @@
 # JWT protocol update
 
+## MajorLoginXGetLoginData reference integration
+
+JWT HTTP 502 responses now identify `stage` (`major_login` or
+`profile_validation`), a safe `reason`, and `upstream_status` when available.
+Exhausted MajorLogin fallbacks include attempt error types and HTTP statuses.
+Server warnings use the same safe diagnostics without raw exception messages,
+passwords or tokens. This distinguishes login rejection from subsequent
+profile authentication failure; it does not bypass either check.
+
+JWT login and internal token refresh now try the supplied reference's
+MajorLogin wire layout first (client version `1.132.9`, field 8 `2019116753`,
+Bearer access-token header, binary content type). Its device-name field 25
+conflicts with the existing nested protobuf field, so this request is encoded
+separately; generated protobuf modules are unchanged. A consistent device
+profile is used with a fresh device identifier and `0.0.0.0` client IP.
+The reference's forced India region is omitted to preserve regional accounts.
+
+The previous minimal request and fingerprint host remain fallbacks. Exact
+protobuf JWT extraction, profile validation, TLS verification, endpoint
+authentication and refresh quotas remain active. GetLoginData is not added to
+JWT generation; the existing guest activation flow already handles that step.
+Reference version values and live acceptance have not been independently
+verified. Deploy `jwt_protocol.py` and restart API and bots to use the update.
+
 The supplied reference is integrated in `jwt_protocol.py`, using its OB55 / 1.132.3 values and version code `2024010012`. These values are taken from the reference, not independently verified against the live service.
 
 ## API usage
