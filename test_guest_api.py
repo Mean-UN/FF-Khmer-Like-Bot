@@ -142,6 +142,16 @@ class GuestApiTests(unittest.TestCase):
                     call.kwargs['data']), 16))
                 self.assertEqual(fields[20], b'8.1.2.3')
 
+    def test_generation_does_not_activate_ind_accounts(self):
+        raw = MajorLoginRes_pb2.MajorLoginRes(
+            account_id=456, token='test-token', lock_region='IND').SerializeToString()
+        with patch('guest_activation.activate_generated') as activate:
+            response, session = self.run_flow(raw, region='IND')
+        self.assertTrue(response.json['success'])
+        activate.assert_not_called()
+        self.assertNotIn('activated', response.json)
+        self.assertFalse(any('GetLoginData' in call.args[0] for call in session.post.call_args_list))
+
     def test_network_profile_matches_login_device(self):
         from Crypto.Cipher import AES
         from Crypto.Util.Padding import unpad

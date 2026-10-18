@@ -415,8 +415,8 @@ def build_proto(fields):
 
 def generate_exponent():
     exp_digits = {'0':'⁰','1':'¹','2':'²','3':'³','4':'⁴','5':'⁵','6':'⁶','7':'⁷','8':'⁸','9':'⁹'}
-    num = random.randint(1, 9999)
-    return ''.join(exp_digits[d] for d in f"{num:04d}")
+    num = random.randint(10000, 999999)
+    return ''.join(exp_digits[d] for d in str(num))
 
 def generate_random_name(base):
     return f"{base}{generate_exponent()}"
@@ -1083,20 +1083,6 @@ def create_guest_account_with_proxy(region, account_name, password_prefix, is_gh
             result.update(success=True, account_id=account_id, jwt_token=jwt_token, major_login=login,
                           major_login_success=True,
                           region=normalize_region(actual_region) if actual_region else requested_region)
-            result["activated"] = False
-            if region == "IND":
-                from guest_activation import activate_generated
-                stage = "GetLoginData"
-                try:
-                    activation = activate_generated(session, jwt_token, open_id, region)
-                    result["activated"] = bool(activation.get("success"))
-                    for key in ("online_ip_port", "chat_ip_port"):
-                        if key in activation:
-                            result[key] = activation[key]
-                    if not result["activated"]:
-                        result["activation_error"] = activation.get("error")
-                except Exception as activation_exc:
-                    result["activation_error"] = f"GetLoginData failed ({type(activation_exc).__name__})"
             return result
         except Exception as exc:
             # Keep created credentials if a later stage fails; callers can recover them.
