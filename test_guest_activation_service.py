@@ -60,5 +60,31 @@ class ActivationServiceTests(unittest.TestCase):
         self.assertIn('invalid JSON', result['error'])
 
 
+class DirectActivationTests(unittest.TestCase):
+    def test_encrypted_gateway_and_reference_payload(self):
+        from Crypto.Cipher import AES
+        from Crypto.Util.Padding import pad, unpad
+        session = Mock()
+        raw = bytes(guest_activation.create_proto({14: "127.0.0.1:1234", 32: "127.0.0.2:5678"}))
+        session.post.return_value.content = AES.new(
+            guest_activation.aes_key, AES.MODE_CBC, guest_activation.aes_iv).encrypt(pad(raw, 16))
+        result = guest_activation.activate_generated(session, "jwt", "open-id")
+        self.assertTrue(result["success"])
+        self.assertEqual(result["online_ip_port"], "127.0.0.1:1234")
+        call = session.post.call_args
+        self.assertEqual(call.kwargs["headers"]["Authorization"], "Bearer jwt")
+        plain = unpad(AES.new(guest_activation.aes_key, AES.MODE_CBC,
+            guest_activation.aes_iv).decrypt(call.kwargs["data"]), 16)
+        fields = guest_activation.decode_protobuf(plain)
+        self.assertEqual(fields[29], b"jwt")
+        self.assertEqual(fields[22], b"open-id")
+        self.assertEqual(fields[7], b"2.133.9")
+
+    def test_missing_gateway_is_not_activated(self):
+        session = Mock()
+        session.post.return_value.content = bytes(guest_activation.create_proto({1: 123}))
+        self.assertFalse(guest_activation.activate_generated(session, "jwt", "open-id")["success"])
+
+
 if __name__ == '__main__':
     unittest.main()

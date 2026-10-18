@@ -216,3 +216,38 @@ def major_login_payload(access_token, open_id, platform_type=4, region="IND"):
     fields[100] = str(platform_type)
     plain = bytes(create_proto(fields))
     return AES.new(aes_key, AES.MODE_CBC, aes_iv).encrypt(pad(plain, AES.block_size))
+
+
+def activate_generated(session, jwt, open_id, region="IND"):
+    """Activate an IND guest with the reference GetLoginData payload."""
+    if region != "IND":
+        return {"success": False, "error": "Reference direct activation supports IND only"}
+    plain = bytes(create_proto(guest_protocol.activation_fields(region, open_id, jwt)))
+    encrypted = AES.new(aes_key, AES.MODE_CBC, aes_iv).encrypt(pad(plain, 16))
+    response = session.post("https://client.ind.freefiremobile.com/GetLoginData",
+        data=encrypted, headers={"Authorization": "Bearer " + jwt, "ReleaseVersion": "OB55",
+        "Content-Type": "application/x-www-form-urlencoded", "X-GA": "v1 1",
+        "X-Unity-Version": "2018.4.12f1",
+        "User-Agent": "UnityPlayer/2018.4.12f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)"},
+        timeout=30, allow_redirects=False)
+    response.raise_for_status()
+    candidates = [response.content]
+    if response.content and len(response.content) % 16 == 0:
+        decrypted = AES.new(aes_key, AES.MODE_CBC, aes_iv).decrypt(response.content)
+        try:
+            decrypted = unpad(decrypted, 16)
+        except ValueError:
+            pass
+        candidates.insert(0, decrypted)
+    if len(response.content) > 64:
+        candidates.append(response.content[64:])
+    for content in candidates:
+        try:
+            fields = decode_protobuf(content)
+            online = fields.get(14, b"").decode("utf-8")
+            if ":" in online:
+                return {"success": True, "online_ip_port": online,
+                        "chat_ip_port": fields.get(32, b"").decode("utf-8") or None}
+        except (ValueError, AttributeError, UnicodeError):
+            continue
+    return {"success": False, "error": "GetLoginData did not return a gateway"}

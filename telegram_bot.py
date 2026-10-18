@@ -3481,6 +3481,11 @@ def generate_and_activate_guest(region, name, progress=None):
         record = guest_account_record(data)
         if progress:
             progress("created")
+        if data.get("activated"):
+            record["activated"] = True
+            if progress:
+                progress("activated")
+            return record, None
         try:
             activation = activate_guest(record["uid"], record["password"], region=record.get("region") or region)
         except Exception as exc:
@@ -3522,6 +3527,9 @@ def process_guestgen(message, region, name, total=None, file_mode=False):
         for job in as_completed(jobs):
             record, error = job.result()
             if record is not None:
+                if file_mode and record.get("account_id") is None:
+                    failures.append(record.get("activation_error") or "Account ID missing")
+                    continue
                 accounts.append(record)
             else:
                 failures.append(error)
