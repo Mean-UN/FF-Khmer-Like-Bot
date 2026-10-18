@@ -292,8 +292,15 @@ def bio_guest_login(uid, password):
 
 
 def get_bio_openid_from_inspect(access_token):
-    info = jwt_protocol.inspect_token(http_session, access_token)
-    return info["open_id"], info
+    response = http_session.get(jwt_protocol.INSPECT_URL, params={"token": access_token}, timeout=15)
+    response.raise_for_status()
+    info = response.json()
+    if not isinstance(info, dict) or info.get("error") or info.get("code", 0) not in (0, "0", None):
+        raise ValueError("Access token inspection rejected the token")
+    data = info.get("data", info)
+    if not isinstance(data, dict) or not isinstance(data.get("open_id"), str) or not data["open_id"].strip():
+        raise ValueError("Access token inspection did not return open_id")
+    return data["open_id"].strip(), info
 
 
 def bio_major_login(access_token, open_id):
@@ -321,19 +328,19 @@ def update_social_bio(jwt_token, bio_text):
     data.field_9 = 1
     data.field_11.CopyFrom(EmptyMessage())
     data.field_12.CopyFrom(EmptyMessage())
-    # Empty length-delimited field 16, present in the supplied OB55 payload.
-    plain = data.SerializeToString() + b"\x82\x01\x00"
+    plain = data.SerializeToString()
     encrypted = BmwNoiNoiBmvYasYas(G, F, plain)
+    device = guest_network.DevicePool.get()
     headers = {
-        "User-Agent": "UnityPlayer/2018.4.12f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)",
-        "Accept": "*/*", "Accept-Encoding": "deflate, gzip",
-        "X-GA": "v1 1", "ReleaseVersion": jwt_protocol.RELEASE_VERSION,
+        "Expect": "100-continue",
+        "User-Agent": f"Dalvik/2.1.0 (Linux; U; Android {device['android_version']}; {device['model']})",
+        "Connection": "Keep-Alive", "Accept-Encoding": "gzip",
+        "X-GA": "v1 1", "ReleaseVersion": os.environ.get("FREEFIRE_VERSION", "OB55"),
         "Content-Type": "application/x-www-form-urlencoded",
-        "X-Unity-Version": "2018.4.12f1",
-        "X-GA-SV": str(int(time.time())),
+        "X-Unity-Version": "2018.4.11f1",
         "Authorization": f"Bearer {jwt_token}",
     }
-    response = http_session.post(url, headers=headers, data=encrypted, timeout=20)
+    response = http_session.post(url, headers=headers, data=encrypted, timeout=30)
     response.raise_for_status()
     return response, url
 
@@ -1750,6 +1757,7 @@ def check_banned():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@FAHHHH.route('/bio_upload', methods=['GET', 'POST'])
 @FAHHHH.route('/bio', methods=['GET', 'POST'])
 def update_bio_api():
     start_time = time.time()
@@ -1767,7 +1775,14 @@ def update_bio_api():
                 return str(value).strip()
         return ""
 
-    bio = read_param("bio")
+    # Preserve the exact bio, including whitespace and line breaks.
+    bio = payload.get("bio")
+    if bio is None:
+        bio = request.args.get("bio")
+    if bio is None:
+        bio = form.get("bio")
+    if bio is not None and not isinstance(bio, str):
+        return jsonify({"status": "error", "message": "Bio must be a string"}), 400
     raw_token = (
         read_param("access_token")
         or read_param("token")
@@ -1779,8 +1794,6 @@ def update_bio_api():
 
     if not bio:
         return jsonify({"status": "error", "message": "Bio is required"}), 400
-    if len(bio) > 250:
-        return jsonify({"status": "error", "message": "Bio must be 250 characters or less"}), 400
     if raw_token.lower().startswith("bearer "):
         raw_token = raw_token[7:].strip()
     jwt_token = raw_token if looks_like_jwt(raw_token) else None
@@ -1813,13 +1826,16 @@ def update_bio_api():
             account_info = decode_bio_jwt(final_jwt) or {"uid": uid}
         else:
             used_method = "access_token"
-            open_id, inspect_data = get_bio_openid_from_inspect(access_token)
+            open_id = read_param("open_id")
             if not open_id:
-                return jsonify({
-                    "status": "error",
-                    "message": "Invalid access token or could not fetch open_id",
-                    "details": inspect_data,
-                }), 400
+                try:
+                    open_id, inspect_data = get_bio_openid_from_inspect(access_token)
+                except (ValueError, requests.HTTPError):
+                    return jsonify({
+                        "status": "error", "success": False,
+                        "error_code": "access_token_unresolved",
+                        "message": "Could not resolve this access token. Use a fresh JWT, UID/password, or access_token with its matching open_id."
+                    }), 401
             final_jwt, platform_type = bio_major_login(access_token, open_id)
             if not final_jwt:
                 return jsonify({"status": "error", "message": "MajorLogin failed for access token"}), 502
