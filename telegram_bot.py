@@ -1226,6 +1226,8 @@ def format_autolike_order(order, title=None, kind="likeff"):
     ]
     if "ORDER EXTENDED" in title:
         lines = lines[:-2]
+        if order.get("_extension_likes") is not None:
+            lines.insert(5, f"\u2795 Total Extended: {int(order['_extension_likes']):,}")
     return "\n".join(lines)
 
 
@@ -1569,6 +1571,10 @@ def deliver_autolike_order(order, kind="likeff", period=None, schedule_next=True
     except (TypeError, ValueError):
         likes_sent = 0
     credited_likes = max(0, likes_sent)
+    if data.get("PlayerNickname"):
+        order["PlayerNickname"] = data["PlayerNickname"]
+    if data.get("Region"):
+        order["Region"] = data["Region"]
     if not order.get("player_name") and data.get("PlayerNickname"):
         order["player_name"] = data.get("PlayerNickname")
     if not order.get("likes_before_purchase"):
@@ -3338,7 +3344,7 @@ def extend_autolikeff_command(message):
         bot.reply_to(message, "ℹ️ AutoLike order not found for this UID.", parse_mode=None)
         return
 
-    text = format_autolike_order(updated_order, title=f"✅ {autolike_label(updated_kind)} ORDER EXTENDED", kind=updated_kind)
+    text = format_autolike_order({**updated_order, "_extension_likes": extra_likes}, title=f"✅ {autolike_label(updated_kind)} ORDER EXTENDED", kind=updated_kind)
     bot.reply_to(message, text, parse_mode="HTML")
     try:
         bot.send_message(int(updated_order.get("telegram_user_id")), text, parse_mode="HTML")

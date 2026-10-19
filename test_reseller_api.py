@@ -20,9 +20,10 @@ class ResellerApiTests(unittest.TestCase):
         self.store = ResellerStore(os.path.join(self.temp.name, 'resellers.sqlite3'))
         self.store.configure('99', 'Seller', 'seller', 10)
         self.app = Flask(__name__)
+        self.app.json.sort_keys = False
         install_reseller_api(self.app, self.store)
         self.client = self.app.test_client()
-        env = patch.dict(os.environ, {'RESELLER_API_KEYS': '{"99":"test-key"}'})
+        env = patch.dict(os.environ, {'RESELLER_API_KEYS': '{"99":"test-key"}', 'RESELLER_API_WAIT_SECONDS': '0'})
         env.start()
         self.addCleanup(env.stop)
         self.orders = []
@@ -35,6 +36,9 @@ class ResellerApiTests(unittest.TestCase):
             deliver_autolike_order_now=Mock(),
             bot=SimpleNamespace(token='1:secret'), logger=Mock())
         self.features = ResellerFeatures(self.core)
+        lookup_patch = patch('reseller_api.lookup_player', return_value={})
+        self.lookup_player = lookup_patch.start()
+        self.addCleanup(lookup_patch.stop)
 
     def save(self, orders, kind):
         self.orders = orders
@@ -338,6 +342,137 @@ class ResellerApiTests(unittest.TestCase):
             response = self.client.get('/autolikeff/status?seller=99&request_id=one',
                                        headers={'Authorization': 'Bearer test-key'})
         self.assertFalse(response.json['worker_online'])
+
+    def test_purchase_waits_for_real_worker_completion(self):
+        import time
+        def work():
+            for _ in range(100):
+                if process_one(self.features):
+                    return
+                time.sleep(0.01)
+        worker = threading.Thread(target=work)
+        worker.start()
+        try:
+            response = self.client.post('/autolikeff', data={
+                'seller': '99', 'uid': '123', 'total': '1000',
+                'request_id': 'wait-test', 'wait_seconds': '2'},
+                headers={'Authorization': 'Bearer test-key'})
+        finally:
+            worker.join(3)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json['state'], 'completed')
+        self.assertEqual(response.json['result']['queued_likes'], 1000)
+        self.assertEqual(self.store.report('99')[0]['cents'], 50)
+        self.assertEqual(len(self.orders), 1)
+
+    def test_wait_timeout_keeps_same_queued_purchase(self):
+        response = self.client.post('/autolikeff', data={
+            'seller': '99', 'uid': '123', 'total': '1000',
+            'request_id': 'wait-test', 'wait_seconds': '0.01'},
+            headers={'Authorization': 'Bearer test-key'})
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.json['state'], 'queued')
+        self.assertEqual(response.headers['Retry-After'], '5')
+        replay = self.submit(total=1000, key='wait-test')
+        self.assertEqual(replay.json['request_id'], response.json['request_id'])
+        with self.store.db() as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM reseller_api_jobs').fetchone()[0], 1)
+
+    def test_invalid_wait_does_not_create_purchase(self):
+        from reseller_api import schema
+        with self.store.db() as db:
+            schema(db)
+        for wait in ('-1', '26', 'nan', 'inf', 'bad'):
+            response = self.client.post('/autolikeff', data={
+                'seller': '99', 'uid': '123', 'total': '1000',
+                'request_id': 'invalid-wait', 'wait_seconds': wait},
+                headers={'Authorization': 'Bearer test-key'})
+            self.assertEqual(response.status_code, 400)
+        with self.store.db() as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM reseller_api_jobs').fetchone()[0], 0)
+
+    def test_order_includes_player_metadata_and_preserves_it_on_extension(self):
+        self.core.call_api.return_value = {'success': True, 'LikesGivenByAPI': 100,
+                                           'PlayerNickname': 'Player', 'Region': 'BD'}
+        self.submit()
+        process_one(self.features)
+        result = self.submit().json['result']
+        self.assertEqual(result['order']['PlayerNickname'], 'Player')
+        self.assertEqual(result['order']['Region'], 'BD')
+        self.submit(total=2000, key='extension')
+        process_one(self.features)
+        result = self.submit(total=2000, key='extension').json['result']
+        self.assertEqual(result['order']['PlayerNickname'], 'Player')
+        self.assertEqual(result['order']['Region'], 'BD')
+
+    def test_order_metadata_defaults_to_empty_strings(self):
+        self.submit(total=2000)
+        process_one(self.features)
+        order = self.submit(total=2000).json['result']['order']
+        self.assertEqual(order['PlayerNickname'], '')
+        self.assertEqual(order['Region'], '')
+
+    def test_scheduled_purchase_fetches_missing_player_information(self):
+        self.lookup_player.return_value = {'PlayerNickname': 'Player', 'Region': 'BD'}
+        self.submit(total=2000)
+        process_one(self.features)
+        order = self.submit(total=2000).json['result']['order']
+        self.assertEqual(order['PlayerNickname'], 'Player')
+        self.assertEqual(order['Region'], 'BD')
+        keys = list(order)
+        self.assertEqual(keys[keys.index('uid') + 1:keys.index('uid') + 3], ['PlayerNickname', 'Region'])
+        self.lookup_player.assert_called_once_with(self.core, '123')
+
+    def test_later_delivery_backfills_saved_purchase_metadata(self):
+        self.submit(total=2000)
+        process_one(self.features)
+        order = dict(self.orders[0], PlayerNickname='Player', Region='BD', sent_likes=100)
+        self.store.record_order(order)
+        result = self.submit(total=2000).json['result']
+        self.assertEqual(result['order']['PlayerNickname'], 'Player')
+        self.assertEqual(result['order']['Region'], 'BD')
+        self.assertEqual(result['queued_likes'], 2000)
+        self.assertEqual(result['charge_cents'], 100)
+
+    def test_failed_owner_message_does_not_block_group_output(self):
+        self.core.OWNER_ID = 7
+        self.core.load_autolike_groups = lambda: ['-100123', '-100456']
+        self.core.bot.send_message = Mock(side_effect=[RuntimeError('owner unavailable'), None, None])
+        self.submit(total=1000)
+        process_one(self.features)
+        calls = self.core.bot.send_message.call_args_list
+        self.assertEqual([call.args[0] for call in calls], [7, -100123, -100456])
+        self.core.bot.send_message.reset_mock(side_effect=True)
+        self.features.send_owner_alerts()
+        self.core.bot.send_message.assert_called_once()
+        self.assertEqual(self.core.bot.send_message.call_args.args[0], 7)
+        self.assertEqual(self.store.pending_owner_alerts(), [])
+
+    def test_group_chat_not_found_uses_other_bot_once(self):
+        self.core.OWNER_ID = 7
+        self.core.load_autolike_groups = lambda: ['-100123']
+        error = RuntimeError('chat not found')
+        error.error_code, error.description = 400, 'Bad Request: chat not found'
+        self.core.bot.send_message = Mock(side_effect=[None, error])
+        self.core.user_bot = SimpleNamespace(send_message=Mock())
+        self.submit(total=1000)
+        process_one(self.features)
+        self.core.user_bot.send_message.assert_called_once()
+        self.assertEqual(self.core.user_bot.send_message.call_args.args[0], -100123)
+        self.assertEqual(self.store.pending_owner_alerts(), [])
+        self.features.send_owner_alerts()
+        self.core.user_bot.send_message.assert_called_once()
+        self.features.send_alert_message('-100123', 'next update', is_group=True)
+        self.assertEqual(self.core.bot.send_message.call_count, 2)
+        self.assertEqual(self.core.user_bot.send_message.call_count, 2)
+
+    def test_group_timeout_does_not_switch_bots(self):
+        self.core.bot.send_message = Mock(side_effect=TimeoutError('unknown delivery'))
+        self.core.user_bot = SimpleNamespace(send_message=Mock())
+        with self.assertRaises(TimeoutError):
+            self.features.send_alert_message('-100123', 'update', is_group=True)
+        self.core.user_bot.send_message.assert_not_called()
 
     def test_worker_count_bounds(self):
         from reseller_api import worker_count

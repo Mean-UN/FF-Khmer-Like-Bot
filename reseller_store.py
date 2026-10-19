@@ -167,6 +167,24 @@ class ResellerStore:
                     delivered = max(0, sent - extension["offset"]) + int(extension.get("initial_likes", 0))
                     db.execute("UPDATE seller_events SET likes=MAX(likes, MIN(package, ?)), detail=? WHERE event_id=?", (delivered, detail, extension["event_id"]))
 
+                # Backfill metadata learned after purchase; keep delivery/billing snapshots intact.
+                player = order.get("PlayerNickname") or order.get("player_name")
+                region = order.get("Region") or order.get("region")
+                if (player or region) and db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='reseller_api_jobs'").fetchone():
+                    rows = db.execute("SELECT event_id,result FROM reseller_api_jobs WHERE uid=? AND state='completed' AND result IS NOT NULL",
+                                      (str(order.get("uid")),)).fetchall()
+                    for row in rows:
+                        result = json.loads(row['result'])
+                        snapshot = result.get('order') if isinstance(result, dict) else None
+                        if not isinstance(snapshot, dict):
+                            continue
+                        if player:
+                            snapshot['PlayerNickname'] = player
+                        if region:
+                            snapshot['Region'] = region
+                        db.execute("UPDATE reseller_api_jobs SET result=? WHERE event_id=?",
+                                   (json.dumps(result), row['event_id']))
+
     def history(self, user_id=None, day=None, page=1, size=20):
         clauses, params = [], []
         if user_id is not None:

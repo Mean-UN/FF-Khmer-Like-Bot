@@ -6,6 +6,7 @@ import re
 import time
 import uuid
 import threading
+import sqlite3
 from weakref import WeakValueDictionary
 from datetime import datetime
 from datetime import timedelta
@@ -91,6 +92,31 @@ def enqueue(store, seller, uid, total, request_id):
         return dict(db.execute("SELECT * FROM reseller_api_jobs WHERE event_id=?", (key,)).fetchone())
 
 
+def wait_for_job(store, job, timeout):
+    """Observe the existing job without holding a write lock or resubmitting it."""
+    deadline = time.monotonic() + timeout
+    while job['state'] in ('queued', 'processing'):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        db = sqlite3.connect(store.path, timeout=min(0.25, remaining))
+        db.row_factory = sqlite3.Row
+        try:
+            row = db.execute("SELECT * FROM reseller_api_jobs WHERE event_id=? AND seller=?",
+                             (job['event_id'], job['seller'])).fetchone()
+            if row is not None:
+                job = dict(row)
+        except sqlite3.OperationalError as exc:
+            if 'locked' not in str(exc).lower() and 'busy' not in str(exc).lower():
+                raise
+        finally:
+            db.close()
+        if job['state'] not in ('queued', 'processing'):
+            break
+        time.sleep(min(0.25, max(0, deadline - time.monotonic())))
+    return job
+
+
 def install_reseller_api(app, store):
     def authenticate():
         seller = str(request.values.get('seller', ''))
@@ -126,10 +152,39 @@ def install_reseller_api(app, store):
                     raise SellerError('uid must be a positive 64-bit number')
                 if not re.fullmatch(r'[0-9]{1,6}', raw_total):
                     raise SellerError('total must be a listed like package')
+                try:
+                    default_wait = float(os.environ.get('RESELLER_API_WAIT_SECONDS', '20'))
+                except ValueError:
+                    default_wait = 20
+                raw_wait = request.values.get('wait_seconds')
+                wait = default_wait if raw_wait is None else float(raw_wait)
+                if not 0 <= wait <= 25:
+                    raise SellerError('wait_seconds must be between 0 and 25')
                 job = enqueue(store, seller, str(int(uid)), int(raw_total), request_id)
+                job = wait_for_job(store, job, wait)
             result = json.loads(job['result']) if job['result'] else None
-            return jsonify(success=job['state'] not in ('failed', 'unknown'), request_id=request_id,
-                           state=job['state'], uid=job['uid'], total=job['total'], result=result, **queue_info(store, job)), (202 if job['state'] in ('queued', 'processing') else 200)
+            if isinstance(result, dict) and isinstance(result.get('order'), dict):
+                delivery = result.get('delivery') or {}
+                for field in ('PlayerNickname', 'Region'):
+                    result['order'][field] = result['order'].get(field) or delivery.get(field) or ''
+                order = result['order']
+                ordered = {}
+                for field, value in order.items():
+                    if field in ('PlayerNickname', 'Region'):
+                        continue
+                    ordered[field] = value
+                    if field == 'uid':
+                        ordered['PlayerNickname'] = order['PlayerNickname']
+                        ordered['Region'] = order['Region']
+                if 'uid' not in order:
+                    ordered.update(PlayerNickname=order['PlayerNickname'], Region=order['Region'])
+                result['order'] = ordered
+            response = jsonify(success=job['state'] not in ('failed', 'unknown'), request_id=request_id,
+                           state=job['state'], uid=job['uid'], total=job['total'], result=result, **queue_info(store, job))
+            if job['state'] in ('queued', 'processing'):
+                response.headers['Retry-After'] = '5'
+                return response, 202
+            return response, 200
         except PermissionError as exc:
             return jsonify(success=False, error=str(exc)), 401
         except (ValueError, TypeError) as exc:
@@ -152,6 +207,16 @@ def finish(store, job, state, result, order=None, kind='autolikeff'):
                     json.dumps(order) if order else None, 0 if order else 1, job['event_id']))
         if state == 'completed' and order is None:
             db.execute("INSERT OR IGNORE INTO seller_owner_alerts (event_id) VALUES (?)", (job['event_id'],))
+
+
+def lookup_player(core, uid):
+    try:
+        data = core.call_api('check-region', {'uid': uid}, timeout=60)
+        if isinstance(data, dict) and not data.get('error'):
+            return {'PlayerNickname': data.get('Name') or data.get('PlayerNickname') or '', 'Region': data.get('Region') or ''}
+    except Exception:
+        core.logger.warning('Could not fetch reseller player information for UID %s', uid)
+    return {}
 
 
 def process_one(features):
@@ -185,6 +250,13 @@ def process_one(features):
                     return True
                 delivered = count
                 delivery = {key: data.get(key) for key in ('PlayerNickname', 'Region', 'LikesbeforeCommand', 'LikesafterCommand')}
+            player = {
+                'PlayerNickname': (delivery or {}).get('PlayerNickname') or (target or {}).get('PlayerNickname') or (target or {}).get('player_name') or '',
+                'Region': (delivery or {}).get('Region') or (target or {}).get('Region') or (target or {}).get('region') or ''}
+            if not all(player.values()):
+                fetched = lookup_player(core, job['uid'])
+                for field in player:
+                    player[field] = player[field] or fetched.get(field) or ''
             with core.autolike_lock:
                 orders = core.load_autolike_orders('likeff')
                 target = next((o for o in orders if str(o.get('uid')) == job['uid'] and o.get('status') != 'cancelled'), None)
@@ -215,6 +287,9 @@ def process_one(features):
                         order['immediate_first_delivery'] = job['total'] != 220
                         if job['total'] == 220:
                             order['last_attempt_period'] = now.date().isoformat()
+                if order:
+                    for field in ('PlayerNickname', 'Region'):
+                        order[field] = player.get(field) or order.get(field) or ''
                 snapshot = dict(order) if order else None
                 if snapshot and target:
                     snapshot.pop('_seller_extension', None)

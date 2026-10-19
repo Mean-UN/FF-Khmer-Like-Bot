@@ -17,6 +17,7 @@ class ResellerFeatures:
         self.store = ResellerStore(os.path.join(core.BASE_DIR, "resellers.sqlite3"))
         self.owner_alert_wakeup = threading.Event()
         self.owner_alert_lock = threading.Lock()
+        self.alert_bots = {}
 
     def api_group_alerts(self, event, report):
         with self.store.db() as db:
@@ -37,7 +38,7 @@ class ResellerFeatures:
         order = result.get('order')
         if order:
             if result.get('action') == 'extended':
-                sections.append(self.core.format_autolike_order(order, title='✅ AUTOLIKEFF ORDER EXTENDED', kind='likeff'))
+                sections.append(self.core.format_autolike_order({**order, '_extension_likes': result.get('queued_likes', 0)}, title='✅ AUTOLIKEFF ORDER EXTENDED', kind='likeff'))
             else:
                 sections.append('\n'.join([
                     '✅ AUTOLIKEFF ORDER CREATED', '━━━━━━━━━━━━━━━━━━━━━━━━',
@@ -47,6 +48,34 @@ class ResellerFeatures:
                     '⏳ First delivery is processing now.' if order.get('immediate_first_delivery') else
                     '✅ Added to AutoLikeFF. Delivery starts tomorrow.']))
         return sections or ['✅ AUTOLIKEFF PURCHASE PROCESSED\n🆔 UID: ' + event['uid']]
+
+    def send_alert_message(self, chat_id, text, is_group=False):
+        primary = self.core.bot
+        alternate = getattr(self.core, "user_bot", None) if is_group else None
+        cached = self.alert_bots.get(str(chat_id), primary)
+        candidates = [cached, primary, alternate]
+        tried = set()
+        last_error = None
+        for candidate in candidates:
+            if candidate is None or id(candidate) in tried:
+                continue
+            tried.add(id(candidate))
+            try:
+                candidate.send_message(int(chat_id), text, parse_mode='HTML' if is_group else None)
+                self.alert_bots[str(chat_id)] = candidate
+                return
+            except Exception as exc:
+                code = getattr(exc, 'error_code', None)
+                description = str(getattr(exc, 'description', '')).lower()
+                inaccessible = ((code == 400 and 'chat not found' in description)
+                                or (code == 403 and any(value in description for value in
+                                    ('not a member', 'kicked', 'forbidden', 'blocked'))))
+                if not is_group or not inaccessible:
+                    # A timeout may have delivered the message; don't try another bot.
+                    raise
+                last_error = exc
+        if last_error is not None:
+            raise last_error
 
     def send_owner_alerts(self):
         with self.owner_alert_lock:
@@ -76,17 +105,23 @@ class ResellerFeatures:
                               f"🎟 Requests left now: {report['remaining']}",
                               f"📅 Bill date: {event['day']}", f"💵 Daily total: {format_usd(report['cents'])}"])
                 for chat_id in destinations:
-                    if self.store.alert_delivered(event["event_id"], chat_id):
-                        continue
-                    is_group = event['event_id'].startswith('api:') and chat_id != str(owner_id)
-                    messages = self.api_group_alerts(event, report) if is_group else ["\n".join(lines)]
-                    for index, text in enumerate(messages):
-                        receipt = f"{chat_id}:part:{index}"
-                        if self.store.alert_delivered(event['event_id'], receipt):
+                    try:
+                        if self.store.alert_delivered(event["event_id"], chat_id):
                             continue
-                        self.core.bot.send_message(int(chat_id), text, parse_mode='HTML' if is_group else None)
-                        self.store.record_alert_delivery(event['event_id'], receipt)
-                    self.store.record_alert_delivery(event["event_id"], chat_id)
+                        is_group = event['event_id'].startswith('api:') and chat_id != str(owner_id)
+                        messages = self.api_group_alerts(event, report) if is_group else ["\n".join(lines)]
+                        for index, text in enumerate(messages):
+                            receipt = f"{chat_id}:part:{index}"
+                            if self.store.alert_delivered(event['event_id'], receipt):
+                                continue
+                            self.send_alert_message(chat_id, text, is_group=is_group)
+                            self.store.record_alert_delivery(event['event_id'], receipt)
+                        self.store.record_alert_delivery(event["event_id"], chat_id)
+                    except Exception:
+                        self.core.logger.warning("Reseller alert %s to chat %s failed; will retry",
+                                                 event["event_id"], chat_id, exc_info=True)
+                if not all(self.store.alert_delivered(event["event_id"], chat_id) for chat_id in destinations):
+                    continue
                 self.store.owner_alert_sent(event["event_id"])
             except Exception as exc:
                 self.core.logger.warning("Reseller owner alert %s failed; will retry: %s", event['event_id'], exc, exc_info=True)
@@ -217,6 +252,9 @@ class ResellerFeatures:
                 if target is None:
                     target = {field: value for field, value in order.items() if field != "_seller_extension"}
                     orders.append(target)
+                for field in ("PlayerNickname", "Region"):
+                    if order.get(field):
+                        target[field] = order[field]
                 extensions = target.setdefault("seller_extensions", [])
                 if not any(item["event_id"] == key for item in extensions):
                     offset = int(target["total_likes"])
@@ -359,7 +397,7 @@ class ResellerFeatures:
             self.core.logger.exception("Reseller extension export failed")
             self.reply(message, "⚠️ Extension processing interrupted. Check /seller history before retrying; saved extensions will be recovered by the worker.")
             return
-        text = self.core.format_autolike_order(target, title="✅ AUTOLIKEFF ORDER EXTENDED", kind="likeff")
+        text = self.core.format_autolike_order({**target, "_extension_likes": package}, title="✅ AUTOLIKEFF ORDER EXTENDED", kind="likeff")
         self.core.active_bot_for(message).reply_to(message, text, parse_mode="HTML")
 
     def format_report(self, reports, day):
